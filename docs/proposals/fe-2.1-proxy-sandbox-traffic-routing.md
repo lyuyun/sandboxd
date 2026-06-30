@@ -136,7 +136,10 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 | FE-1.2 Auto-suspend | 协作：suspend 触发 routesync upsert(paused)；流量触发 wake | park_timeout 须 > resume P99 |
 | FE-1.3 Secure 模式 | 协作：mmds.enabled=true 时 proxy 内嵌 MMDS；serve 生成 mmds_secret 经 routesync 下发 | MMDS sidecar 须与 proxy worker 同进程 |
 | FE-7.1 网络基础设施 | 依赖：floatingip 由 vswitch-ctl attach 分配后才写入 RouteEntry | vswitch 须先于 proxy 就绪 |
-| FE-7.2 高性能数据面 | 协作：proxy 新建连接后注册 flowtable，后续由 TC hook 内核转发 | bpffs 须挂载于 /sys/fs/bpf |
+
+| 规划特性（未实现）| 关系 | 约束 |
+|----------------|------|------|
+| FE-7.2 高性能数据面 | 协作：proxy 新建连接后注册 flowtable，后续由 TC hook 内核转发（当前 FE-2.1 阶段全程用户态 splice）| bpffs 须挂载于 /sys/fs/bpf |
 
 ### 3.4 风险及设计约束
 
@@ -144,7 +147,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 |------|------|---------|
 | serve 重启期间 paused 沙箱 wake 无人应答 | park 超时后用户请求 404 | park_timeout 默认 90 s，serve 重启 < 5 s；告警 serve 重启时间异常 |
 | proxy worker 订阅通道积压（> 1024 帧）| subscriber 被丢弃，需全量重同步 | 指数退避重连；监控 `proxy_routesync_reconnect_total` |
-| bpffs 未挂载或 flowtable map 不存在 | proxy 降级为纯用户态转发（仍可用，但内核旁路不生效）| 启动时检查 `/sys/fs/bpf/vswitch/map_flowtable`，缺失则 warn 并降级 |
+| bpffs 未挂载或 flowtable map 不存在 **[FE-7.2 实现后生效]** | proxy 降级为纯用户态转发（仍可用，但内核旁路不生效）| 启动时检查 `/sys/fs/bpf/vswitch/map_flowtable`，缺失则 warn 并降级 |
 | TLS 证书更新期间短暂服务中断 | 新建 TLS 握手失败 | 双 worker 滚动重启：先重启 worker-1，再重启 worker-2 |
 | park 队列 goroutine 泄漏（sid 永不 resume）| 内存缓慢增长 | park_timeout 超时后强制释放所有 goroutine；Dead 路由删除时同步清队列 |
 
@@ -156,7 +159,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 |------|------|---------|
 | 纯 iptables/nftables DNAT | 不需要 proxy 进程，直接在宿主机规则链转发 | 规则随沙箱密度线性膨胀；控制面重启时规则管理复杂；无 park/wake 能力 |
 | Envoy xDS proxy | 复用成熟代理组件 | 引入 C++ 依赖；xDS 协议替换 routesync 增加集成成本；MMDS 无法内嵌 |
-| 用户态纯 splice（不集成 eBPF）| 实现简单 | 高并发下每个报文均需用户态 → 内核态 → 用户态往返，吞吐瓶颈明显 |
+| 用户态纯 splice（不集成 eBPF）| 实现简单 | FE-2.1 当前即为此方案；高并发下每个报文均需用户态往返，吞吐受限；FE-7.2 叠加 eBPF flowtable 后此方案退化为首包处理 + 回退模式 |
 
 ---
 
@@ -209,7 +212,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  ┌─ config-socket (UDS, h2c, 4 planes) ──┐   │      │  │ running + 49983 → envd.sock  (UDS splice)      │  │ │
 │  │  │ /run/sandbox/node-ctl.socket           │   │      │  │ running + 49999 → ci.sock    (UDS splice)      │  │ │
 │  │  │                                        │   │      │  │ running + other → floatingip:port (TCP splice) │  │ │
-│  │  │ task  plane ◄── sandbox-ctl           │   │      │  │                 + write bpffs map_flowtable     │  │ │
+│  │  │ task  plane ◄── sandbox-ctl           │   │      │  │           + write bpffs map_flowtable [FE-7.2]  │  │ │
 │  │  │  /internal/task/launchspec            │   │      │  │ paused → ParkQueue (挂起) + WakeSender          │  │ │
 │  │  │  SO_PEERCRED pid == sandbox-ctl pid   │   │      │  │ saved  → 409 Conflict + migration_token         │  │ │
 │  │  │                                        │   │      │  │ 无路由 → 404 / 410                              │  │ │
@@ -238,7 +241,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  └────────────────────────┬──────────────────────┘      │  │ PUT /latest/api/token → HMAC token (确定性)     │  │ │
 │                           │ D-Bus / sdbus                │  │ GET /latest/meta-data → accessTokenHash         │  │ │
 │                           │ StartUnit / StopUnit /       │  └──────────────────────────────────────────────┘  │ │
-│                           │ ListUnitsByPatterns           │  ┌─ FlowTableWriter ──────────────────────────────┐  │ │
+│                           │ ListUnitsByPatterns           │  ┌─ FlowTableWriter [计划中，FE-7.2，未实现] ───────┐  │ │
 │                           │                              │  │ 新建 TCP 连接后:                                 │  │ │
 │                           │ + vswitch-ctl attach/detach  │  │ bpf_map_update_elem(map_flowtable,              │  │ │
 │                           │   (subprocess, node-ctl 调)  │  │   {src4,sport,dst4,dport}, {floatingip,port})   │  │ │
@@ -311,8 +314,8 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  │  │                                                                                              │  │  │   │
 │  │  │  │  user app      :PORT  (sandbox-ctl 不在此路径；经 virtio-net 而非 vsock relay)              │  │  │   │
 │  │  │  │    入向: node-proxy → floatingip:PORT → vswitch GENEVE/tap → CH virtio-net → guest         │  │  │   │
-│  │  │  │    首包: node-proxy splice + write flowtable                                                 │  │  │   │
-│  │  │  │    后续: TC hook 内核直通，绕过 node-proxy                                                   │  │  │   │
+│  │  │  │    当前: node-proxy 全程 splice（write flowtable 待 FE-7.2 实现）                             │  │  │   │
+│  │  │  │    FE-7.2 后: TC hook 内核直通，绕过 node-proxy                                              │  │  │   │
 │  │  │  │                                                                                              │  │  │   │
 │  │  │  │  MMDS 握手     169.254.169.254:80 ──(vswitch DNAT)──► 127.0.0.1:19254 (node-proxy MMDS)     │  │  │   │
 │  │  │  │                                                                                              │  │  │   │
@@ -345,12 +348,12 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  bpffs  /sys/fs/bpf/vswitch/                                                                             │   │
 │  │  ├─ prog_tc_ingress / prog_tc_egress   TC hook, attach on transit NIC (eth1)                            │   │
 │  │  │                                                                                                       │   │
-│  │  ├─ map_flowtable   BPF_MAP_TYPE_LRU_HASH                                                               │   │
+│  │  ├─ map_flowtable   BPF_MAP_TYPE_LRU_HASH  [FE-7.2，未实现]                                             │   │
 │  │  │    key:  {src_ip, src_port, dst_ip, dst_port} (网络字节序)                                            │   │
 │  │  │    val:  {floatingip, port}                                                                           │   │
-│  │  │    ↑ node-proxy FlowTableWriter  bpf_map_update_elem  (新建 TCP 连接后写入)                          │   │
-│  │  │    ↑ node-proxy                  bpf_map_delete_elem  (连接关闭后清理)                               │   │
-│  │  │    ← TC hook 读取: 已建连接在内核路径直接转发, 报文不再经过 node-proxy 用户态                          │   │
+│  │  │    ↑ node-proxy FlowTableWriter  bpf_map_update_elem  (新建 TCP 连接后写入) [未实现]                 │   │
+│  │  │    ↑ node-proxy                  bpf_map_delete_elem  (连接关闭后清理)      [未实现]                 │   │
+│  │  │    ← TC hook 读取: 已建连接在内核路径直接转发, 报文不再经过 node-proxy 用户态 [未实现]                 │   │
 │  │  │                                                                                                       │   │
 │  │  ├─ map_conntrack   SYNACK / ESTABLISHED / CLOSING  (连接状态追踪)                                       │   │
 │  │  └─ map_egress_policy / map_egress_allow_lpm / map_egress_deny_lpm  (出站策略, FE-NET-1.1)              │   │
@@ -542,7 +545,7 @@ systemd                node-proxy worker               node-ctl serve           
    │        │                   │                       │                  │ TCP 连接建立
    │        │◄──────────────────────────────────────────────────────────────│
    │        │    TCP splice 双向字节流（Forwarder/vsock 不在此路径）
-   │        │    首包: write flowtable；后续: TC hook 内核直通，绕过 node-proxy
+   │        │    当前: node-proxy 全程 splice；write flowtable + TC hook 内核直通待 FE-7.2 实现
 ```
 
 #### 4.0.4 关键 IPC 通道一览
@@ -567,7 +570,7 @@ systemd                node-proxy worker               node-ctl serve           
 | envd.sock / ci.sock | UDS (AF_UNIX stream) | `/run/sandbox/<sid>/envd.sock` | proxy → Forwarder（vsock 反向通道入口）| — (上层 token 鉴权) |
 | vsock.sock | UDS (AF_UNIX stream) | `/run/sandbox/<sid>/vsock.sock` | Forwarder → CH virtio-vsock（层1 CONNECT + 层2 TypeConnect）| — (host-only socket) |
 | floatingip:PORT | TCP | sandbox floatingip:PORT（vswitch GENEVE 路由）| proxy splice → vswitch GENEVE/tap → CH virtio-net → guest user app（sandbox-ctl 不参与）| X-Access-Token (proxy 层) |
-| bpffs map_flowtable | 内核 BPF map | `/sys/fs/bpf/vswitch/map_flowtable` | proxy 写 / TC hook 读 | CAP_SYS_ADMIN (root only) |
+| bpffs map_flowtable **[FE-7.2，未实现]** | 内核 BPF map | `/sys/fs/bpf/vswitch/map_flowtable` | proxy 写 / TC hook 读 | CAP_SYS_ADMIN (root only) |
 | MMDS v2 HTTP | HTTP/1.1 loopback | `127.0.0.1:19254` | guest envd → proxy（经 vswitch DNAT）| MMDS session token |
 
 #### 4.0.5 proxy.mode=internal 进程拓扑差异
@@ -851,9 +854,7 @@ node-proxy worker  [node-proxy@N.service，host netns]
   │                             FloatingIP:"x.x.x.x"}
   │  AuthMiddleware.Check(X-Access-Token)   [enforce 模式]
   │  Dispatcher: other port → dial TCP(FloatingIP:PORT)
-  │  io.Copy 双向 splice 启动（用户态字节搬运）
-  │  FlowTableWriter.Register({src_ip,src_port,dst_ip,dst_port} → {floatingip,PORT})
-  │    → bpf_map_update_elem(map_flowtable, key, val)   [写 /sys/fs/bpf/vswitch/]
+  │  io.Copy 双向 splice 启动（用户态字节搬运，全程经过 node-proxy）
   ▼
 sandbox-vswitch  [sw0_vswitch netns，GENEVE overlay]
   │  TC eBPF 按 FloatingIP 路由 → tap fd（cloud-hypervisor 通过 SCM_RIGHTS 持有）
@@ -887,14 +888,14 @@ guest 用户 app
 ← 完全绕过 node-proxy 用户态，吞吐量接近线速
 ```
 
-连接关闭时，node-proxy 保留一个轻量 goroutine 监听 FIN/RST，收到后执行 `bpf_map_delete_elem` 清理 flowtable 条目，防止 4 元组复用时命中过期条目。
+连接关闭时，node-proxy 保留一个轻量 goroutine 监听 FIN/RST，收到后执行 `bpf_map_delete_elem` 清理 flowtable 条目，防止 4 元组复用时命中过期条目。**[FE-7.2 实现后生效；当前无 flowtable，连接关闭仅回收 io.Copy goroutine]**
 
 与 envd/ci 路径的关键差异：
 
 | 维度 | envd/ci（port 49983/49999） | 用户端口（其他 port） |
 |------|----------------------------|----------------------|
-| 转发层 | UDS → vsock（始终经过 sandbox-ctl） | TCP → vswitch GENEVE（首包经过 node-proxy，后续内核直通） |
-| 数据路径中的进程 | node-proxy + sandbox-ctl（全程字节 relay） | node-proxy（仅首包），后续绕过所有用户态 |
+| 转发层 | UDS → vsock（始终经过 sandbox-ctl） | TCP → vswitch GENEVE（当前全程经过 node-proxy；FE-7.2 后首包经 node-proxy，后续内核直通）|
+| 数据路径中的进程 | node-proxy + sandbox-ctl（全程字节 relay） | 当前：node-proxy 全程 io.Copy；FE-7.2 后：首包经 node-proxy，后续绕过所有用户态 |
 | 网络命名空间穿越 | host UDS → vsock 虚拟设备 | host netns → vswitch netns → guest netns |
 | 快照/暂停影响 | Forwarder.Pause() 阻断新连接 | paused 状态下 Resolve() 挂起请求，Table.Wake() 发 wake 帧 |
 | 吞吐量上限 | sandbox-ctl io.Copy goroutine 瓶颈 | 当前：node-proxy io.Copy；FE-7.2 后：TC hook 线速转发 |
