@@ -292,8 +292,8 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │    snapshot_request: 暂停 VM → CH API → 创建快照 → 返回路径 (一次性, 关闭连接)                          │   │
 │  │    exec_request:     握手 → stdio MUX relay (ExecHandler 接管连接生命周期)                              │   │
 │  │                                                                                                          │   │
-│  │  注: sandbox-ctl 留在父 cgroup，不进入 /sys/fs/cgroup/sandboxes/<sid>/                                  │   │
-│  │      仅 cloud-hypervisor PID 移入沙箱 cgroup; 防 memory.high 节流 sandbox-ctl 引发死锁                  │   │
+│  │  注(cgroup): 当前 --cgroup-adopt：sandbox-ctl 与 CH 同处 unit cgroup；memory.high 节流存在死锁风险      │   │
+│  │              计划 --cgroup-isolated：sandbox-ctl 留 unit cgroup，CH 移入子 cgroup <unit>/<sid>/          │   │
 │  │                                                                                                          │   │
 │  │  ┌─ cloud-hypervisor [child process，可选进入 tap netns] ────────────────────────────────────────────┐  │   │
 │  │  │  TAP fd ←── vswitch-ctl open-port (SCM_RIGHTS via TAPFD_SOCKET UDS)                               │  │   │
@@ -358,7 +358,8 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  ├─ map_conntrack   SYNACK / ESTABLISHED / CLOSING  (连接状态追踪)                                       │   │
 │  │  └─ map_egress_policy / map_egress_allow_lpm / map_egress_deny_lpm  (出站策略, FE-NET-1.1)              │   │
 │  │                                                                                                          │   │
-│  │  cgroup v2  /sys/fs/cgroup/sandboxes/<sid>/                                                              │   │
+│  │  cgroup v2  当前: unit cgroup（--cgroup-adopt，sandbox-ctl + CH 同处）                                  │   │
+│  │             计划: <unit-cgroup>/sandbox-<sid>/（--cgroup-isolated，仅 CH）                              │   │
 │  │  ├─ memory.max / memory.current / memory.stat     ← resource controller 读取 (Active Reclaimer)        │   │
 │  │  └─ cpu.stat / cpuset.cpus.effective              ← metrics API 读取 (FE-9.1)                          │   │
 │  └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
@@ -830,7 +831,7 @@ vsock 通道建立后，Forwarder 发送应用层帧 `TypeConnect{Network:"tcp",
 - **sandbox-ctl 是数据面上的字节 relay**，不只是控制面组件；每个数据字节都经过 sandbox-ctl 进程的 `io.Copy` goroutine 搬运
 - `envd.sock` 是 sandbox-ctl 在 host 侧创建的 UDS 监听器，并非 envd 自身的 socket
 - `vsock.sock` 是 cloud-hypervisor 暴露的 vsock 设备入口，sandbox-ctl Forwarder 通过它向 guest 内发起反向连接
-- sandbox-ctl 故意**不进入沙箱 cgroup**，是为了防止 guest 内存压力触发 `memory.high` 时将 sandbox-ctl 自身节流，进而卡住这条 relay 链路造成死锁
+- **sandbox-ctl cgroup 隔离**：当前（`--cgroup-adopt`）sandbox-ctl 与 CH 同处 unit cgroup，`memory.high` 节流时存在 relay 链路死锁风险，当前接受该代价；计划（`--cgroup-isolated`，未实现）sandbox-ctl 留在 unit cgroup，CH 移入子 cgroup，彻底消除节流路径
 
 `--connect` 指令由 orchestrator 在 `LaunchSpec` 中注入（`sandboxcfg.ConnectSpecs()`），仅对 e2b profile 生效；bare profile 不暴露控制端口。快照（pause）期间 Forwarder 会先 `Pause()` 阻止新连接，再 `CloseActive()` 折叠活跃 relay，保证快照窗口内无半开连接。
 
@@ -1419,7 +1420,7 @@ vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存）
 - **全量同步孤儿清理**：`bookmark` 收到后，删除本次同步未出现的路由条目，防止路由表与 serve 状态永久分叉。
 - **MMDS token 无状态**：token = `sid + "." + hex(HMAC-SHA256(mmds_secret, sid))`，确定性计算，无存储、无 TTL；token 泄露风险由 mmds_secret 轮换（sandbox 销毁）覆盖。
 - **Forwarder 快照静默期保护**：快照（pause）开始前 `Forwarder.Pause()` 阻止新连接进入 envd.sock/ci.sock，`CloseActive()` 折叠所有活跃 vsock relay（层1通道 + 层2字节流一并关闭），保证快照窗口内不存在半开的 vsock 连接；快照完成后 `Resume()` 重新开放监听。防止快照期间 relay goroutine 持有 vsock channel 导致 VM 状态不一致。
-- **sandbox-ctl cgroup 隔离防死锁**：sandbox-ctl（含 Forwarder relay goroutine）故意留在父 cgroup，不进入 `/sys/fs/cgroup/sandboxes/<sid>/`；仅 cloud-hypervisor PID 移入沙箱 cgroup。防止 guest 内存压力触发 `memory.high` 节流时将 Forwarder 的 vsock relay（层1 virtqueue 写入 + 层2 io.Copy）一并节流，进而卡住整条 `node-proxy ↔ Forwarder ↔ CH virtio-vsock ↔ vsock relay ↔ envd` 链路造成死锁。
+- **sandbox-ctl cgroup 隔离防死锁**：当前（`--cgroup-adopt`）sandbox-ctl 与 CH 同处 systemd unit cgroup；`memory.high` 节流时 Forwarder relay goroutine（层1 virtqueue 写入 + 层2 io.Copy）可能被一并卡住，造成整条 `node-proxy ↔ Forwarder ↔ CH virtio-vsock ↔ vsock relay ↔ envd` 链路死锁；该风险当前已知并接受。计划（`--cgroup-isolated`，未实现）：sandbox-ctl 留在 unit cgroup，CH 移入子 cgroup `<unit-cgroup>/sandbox-<sid>/`；`memory.high` 仅节流 CH，sandbox-ctl 可随时发出 balloon inflate 命令解压；`KillMode=control-group` 覆盖整个子树，CH 不会因 sandbox-ctl 退出而成为孤儿。
 - **tap fd TUNSETPERSIST 防用户端口中断**：用户端口数据面路径（`vswitch tap → CH virtio-net → guest`）与 sandbox-ctl 完全解耦。cloud-hypervisor 崩溃时 tap fd 引用计数归零，字符设备端关闭；但 sw0-tN 因 `TUNSETPERSIST(1)` 仍留在 switch netns，下次 CH 重启时 `vswitch-ctl open-port` 重新交接新 fd，用户端口数据面可自愈，无需重建 vswitch 端口或重写 eBPF flowtable 条目。
 
 ### 6.3 过载控制
