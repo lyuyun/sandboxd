@@ -276,14 +276,14 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  ┌─ Forwarder  (e2b profile 专有，pkg/sandbox/forward.go) ──────────────────────────────────────────┐   │   │
 │  │  │  host 侧创建 UDS 监听器；每条新连接经两层协议向 guest 建立 vsock 反向通道:                       │   │   │
 │  │  │  层1(连接建立): dial vsock.sock → CONNECT <port>\n                                               │   │   │
-│  │  │                → CH virtio-vsock virtqueue → guest kernel virtio_vsock 驱动 → relay 进程         │   │   │
-│  │  │  层2(应用协议): TypeConnect{Network,Address} 帧 → guest relay dial 目标本地端口                  │   │   │
+│  │  │                → CH virtio-vsock virtqueue → guest kernel virtio_vsock 驱动 → sandbox-init（serveReverseChannel goroutine）         │   │   │
+│  │  │  层2(应用协议): TypeConnect{Network,Address} 帧 → sandbox-init dial 目标本地端口                  │   │   │
 │  │  │                                                                                                   │   │   │
 │  │  │  /run/sandbox/<sid>/envd.sock  ←── node-proxy dial (port 49983)                                  │   │   │
-│  │  │    层2 帧: TypeConnect{tcp, 127.0.0.1:49983} → guest relay → envd:49983                         │   │   │
+│  │  │    层2 帧: TypeConnect{tcp, 127.0.0.1:49983} → sandbox-init → envd:49983                         │   │   │
 │  │  │                                                                                                   │   │   │
 │  │  │  /run/sandbox/<sid>/ci.sock    ←── node-proxy dial (port 49999)                                  │   │   │
-│  │  │    层2 帧: TypeConnect{tcp, 127.0.0.1:49999} → guest relay → code-interp:49999                  │   │   │
+│  │  │    层2 帧: TypeConnect{tcp, 127.0.0.1:49999} → sandbox-init → code-interp:49999                  │   │   │
 │  │  │                                                                                                   │   │   │
 │  │  │  Pause()/CloseActive()/Resume(): 快照静止期冻结新连接，折叠活跃 relay                              │   │   │
 │  │  └───────────────────────────────────────────────────────────────────────────────────────────────── ┘   │   │
@@ -305,14 +305,14 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  │  │                                                                                              │  │  │   │
 │  │  │  │  sandbox-init (PID 1)   → POST /init  (envd re-key, Secure 模式)                            │  │  │   │
 │  │  │  │                                                                                              │  │  │   │
-│  │  │  │  vsock relay           ← 层1 终点: 接受 virtio-vsock 连接 (host Forwarder CONNECT <port>)    │  │  │   │
+│  │  │  │  sandbox-init          ← serveReverseChannel goroutine，层1 终点: 接受 virtio-vsock 连接     │  │  │   │
 │  │  │  │                           读层2 TypeConnect{Network,Address} → dial 目标本地端口             │  │  │   │
 │  │  │  │                           在 vsock channel 与本地 TCP 连接之间做字节 relay                   │  │  │   │
 │  │  │  │                                                                                              │  │  │   │
-│  │  │  │  envd          :49983  ← vsock relay dial (TypeConnect{tcp,127.0.0.1:49983})                │  │  │   │
-│  │  │  │  code-interp   :49999  ← vsock relay dial (TypeConnect{tcp,127.0.0.1:49999})                │  │  │   │
+│  │  │  │  envd          :49983  ← sandbox-init dial (TypeConnect{tcp,127.0.0.1:49983})                │  │  │   │
+│  │  │  │  code-interp   :49999  ← sandbox-init dial (TypeConnect{tcp,127.0.0.1:49999})                │  │  │   │
 │  │  │  │                                                                                              │  │  │   │
-│  │  │  │  user app      :PORT  (sandbox-ctl 不在此路径；经 virtio-net 而非 vsock relay)              │  │  │   │
+│  │  │  │  user app      :PORT  (sandbox-ctl 不在此路径；经 virtio-net 而非 sandbox-init vsock relay)              │  │  │   │
 │  │  │  │    入向: node-proxy dial(floatingip:PORT) → mg0(root netns) → veth → sw-mX(switch netns)    │  │  │   │
 │  │  │  │           → TC DNAT(floatingip→inner_ip) → bpf_redirect → sw0-tN tap → CH virtio-net → guest │  │  │   │
 │  │  │  │    回程: guest → CH virtio-net → tap → sw0-tN TC SNAT(inner_ip→floatingip) → sw-mX → mg0   │  │  │   │
@@ -516,7 +516,7 @@ systemd                node-proxy worker               node-ctl serve           
    │                          │                               │                         │
    │           [数据面: envd 端口连接建立（port=49983 为例）]  │                         │
    │                          │                               │                         │
-   │  node-proxy worker    Forwarder(sandbox-ctl)    cloud-hypervisor   vsock relay   envd:49983
+   │  node-proxy worker    Forwarder(sandbox-ctl)    cloud-hypervisor   sandbox-init  envd:49983
    │        │                    │                         │                │               │
    │        │ Dispatcher:        │                         │                │               │
    │        │ dial(envd.sock)    │                         │                │               │
@@ -534,7 +534,7 @@ systemd                node-proxy worker               node-ctl serve           
    │        │                    │                         │                ├──────────────►│
    │        │                    │                         │                │  TCP 连接建立 │
    │        │◄─────────────────────────────────────────────────────────────────────────────-│
-   │        │    io.Copy relay 双向字节流（Forwarder ↔ vsock ↔ vsock relay ↔ envd）
+   │        │    io.Copy relay 双向字节流（Forwarder ↔ vsock ↔ sandbox-init ↔ envd）
    │
    │           [数据面: 用户端口连接建立（port=PORT，sandbox-ctl 不参与）]
    │
@@ -755,9 +755,8 @@ node-ctl.service
 |------|------|
 | `TLSListener` | 监听 `--data-listen`（SO_REUSEPORT），TLS 握手，Accept 循环 |
 | `HostRouter` | 解析 HTTP Host header，提取 `(sid, port)`；支持 `<port>-<sid>.<domain>` 和 `E2b-Sandbox-Id` 两种寻址 |
-| `RouteTable` | 本地路由表（`sync.Map[sid → RouteEntry]`）；`ApplyUpsert`、`ApplyDelete`、`Lookup` |
-| `Dispatcher` | 按 (sid, port, state) 路由到目标：UDS splice / TCP splice / park；e2b profile port 49983/49999 → KindUDS；bare profile 访问此二端口 → KindDeny(501)；其他端口 → KindTCP；UDS 目标为 sandbox-ctl Forwarder 持有的 host 侧 UDS，每条连接经 vsock 反向通道穿透到 guest 内 envd/ci 进程 |
 | `RouteTable` | 本地路由表（`sync.Map[sid → RouteEntry]`）；`ApplyUpsert`、`ApplyDelete`、`Lookup`；`Resolve(ctx, sid, port)` 内部实现 park/wake：paused 时挂起在 `waiters[sid] chan struct{}`，同时调 `Table.Wake(sid)` 写 wakeCh；`notifyLocked(sid)` 在 ApplyUpsert/Delete 时解除挂起；`pending map[string]bool` 防止同 sid 重复发 wake 帧 |
+| `Dispatcher` | 按 (sid, port, state) 路由到目标：UDS splice / TCP splice / park；e2b profile port 49983/49999 → KindUDS；bare profile 访问此二端口 → KindDeny(501)；其他端口 → KindTCP；UDS 目标为 sandbox-ctl Forwarder 持有的 host 侧 UDS，每条连接经 vsock 反向通道穿透到 guest 内 envd/ci 进程 |
 | `RouteSyncClient` | config-socket plugin 平面 h2c 客户端；register 帧作为请求 body 发出（首帧），服务端回 hello 后再推全量 upsert + bookmark；增量订阅；指数退避重连 |
 | `MMDSServer` | 内嵌 MMDS v2 HTTP handler（`--mmds-listen`）；`ByFloatingIP` 查路由表；token = `sid + "." + hex(HMAC-SHA256(mmds_secret, sid))`，确定性，无存储 |
 | `FlowTableWriter` | **[计划中，FE-7.2，当前未实现]** 新建 TCP 连接后写 eBPF flowtable（`bpf_map_update_elem`）；连接关闭后清理 |
@@ -785,51 +784,76 @@ node-proxy worker  [node-proxy@N.service，host netns]
   │  AuthMiddleware.Check(X-Access-Token)   [enforce 模式]
   │  Dispatcher: port 49983 → dial("unix", EnvdUDS)
   ▼
-sandbox-ctl Forwarder.acceptLoop  [sandbox-ctl run 进程，host netns，父 cgroup]
-  │  /run/sandbox/<sid>/envd.sock 上接受连接
-  │  层1: OpenForward() → dial /run/sandbox/<sid>/vsock.sock
-  │       发送 CONNECT <port>\n  （指定 guest 侧 vsock 监听端口）
+sandbox-ctl Forwarder  [host netns，goroutine]
+  │  acceptLoop 在 /run/sandbox/<sid>/envd.sock（UDS）上接受连接
+  │
+  │  ── 层1: 建立 host↔guest vsock 通道 ──
+  │  OpenForward(): dial /run/sandbox/<sid>/vsock.sock（UDS，CH 暴露的 vsock 设备入口）
+  │  发送 CONNECT <vsock-port>\n
+  │  （等待 sandbox-init 完成 AF_VSOCK accept，层1 通道就绪）
+  │
+  │  ── 层2: 协商 guest 侧目标 ──
+  │  发送 TypeConnect{Network:"tcp", Address:"127.0.0.1:49983"}
+  │  等待 TypeConnectAck
+  │
+  │  ── 层3: 数据搬运（fwd frame protocol）──
+  │  启动 fwd.Relay.Run()
+  │    plain→framed: 用户字节 → FrameData；TCP EOF → FrameEOF；读错误 → FrameRST
+  │    framed→plain: FrameData → write；FrameEOF → CloseWrite()；FrameRST → abort
   ▼
 cloud-hypervisor  [virtio-vsock 设备后端，host 用户态]
   │  收到 CONNECT 请求 → 写入 virtio-vsock virtqueue（共享内存）
-  │  通知 guest kernel（类似 virtio-net kick 机制）
+  │  通知 guest kernel（virtio kick）
   ▼
 guest kernel virtio_vsock 驱动
-  │  从 virtqueue 读取连接请求 → 交给监听该 vsock port 的进程
+  │  从 virtqueue 读取连接请求 → 递交给 AF_VSOCK 监听方
   ▼
-guest vsock relay  [guest 内，层1 终点]
-  │  层1 通道建立完成（双向字节流就绪）
-  │  层2: 读 TypeConnect{Network:"tcp", Address:"127.0.0.1:49983"}
-  │       dial tcp 127.0.0.1:49983
+sandbox-init  [guest PID 1，serveReverseChannel goroutine]
+  │  AF_VSOCK listener 接受连接 → 层1 通道就绪（Forwarder ↔ sandbox-init 双向字节流）
+  │
+  │  ── 层2: 在已建立的 vsock 通道内协商 guest 侧目标 ──
+  │  Forwarder 发 TypeConnect{Network:"tcp", Address:"127.0.0.1:49983"}
+  │  sandbox-init 读 TypeConnect → net.Dial("tcp", "127.0.0.1:49983") → 发 TypeConnectAck
+  │  ── 层3: 数据搬运（fwd frame protocol）──
+  │  双方启动 fwd.Relay.Run():
+  │    Forwarder:    plain=UDS conn，framed=vsock conn
+  │    sandbox-init: plain=TCP conn，framed=vsock conn
+  │    帧格式: [type u8][len u16BE][payload]；FrameData/FrameEOF/FrameRST
+  │    FrameEOF 在带内传递 TCP half-close（CH vsock proxy 不透传 shutdown(SHUT_WR)）
   ▼
 envd 进程  [guest 内，监听 127.0.0.1:49983]
 
-← 双向 io.Copy relay 贯通整条链路：
-   建立过程（两层协议）:
-     层1: Forwarder dial vsock.sock → CONNECT <port>\n
-          → CH virtio-vsock virtqueue → guest kernel virtio_vsock → vsock relay（层1终点）
-     层2: Forwarder 发 TypeConnect{tcp, 127.0.0.1:49983}
-          → vsock relay dial :49983 → envd（层2终点，连接就绪）
-   字节流路径:
-     客户端 ↔ node-proxy ↔ Forwarder ↔ [vsock.sock → CH virtio-vsock → vsock relay] ↔ envd
+← 字节流完整路径:
+   客户端 ↔ node-proxy
+           ↕ UDS (envd.sock)
+         Forwarder [层1 vsock 通道 + 层2 TypeConnect 协商 + 层3 fwd frame relay]
+           ↕ vsock.sock → CH virtio-vsock virtqueue（层3 fwd frames）
+         sandbox-init [层2 TypeConnect 处理 + 层3 fwd frame relay]
+           ↕ TCP loopback (127.0.0.1:49983)（层3 plain 侧裸字节）
+         envd
 ```
 
-**vsock 通道的两层协议**
+**vsock 通道的三层协议**
 
-Forwarder 从 vsock.sock 到 guest envd 的过程涉及两个独立的协议层：
+Forwarder 从 vsock.sock 到 guest envd 的过程涉及三个独立的协议层：
 
 *第一层：vsock 连接建立（Forwarder ↔ CH，通过 virtio-vsock virtqueue）*
 
-vsock.sock 是 CH 实现的 vsock 设备 host 侧 Unix socket 入口。Forwarder dial vsock.sock 后，先发送连接请求（`CONNECT <port>\n`），指定 guest 侧 vsock 监听端口。CH 收到后通过 **virtio-vsock virtqueue**（共享内存，类似 virtio-net 但完全绕过网络栈）将连接请求推给 guest 内核的 `virtio_vsock` 驱动，驱动交给 guest 内监听该端口的 vsock relay 进程。至此 Forwarder 与 guest relay 之间建立了一条双向字节流通道。
+vsock.sock 是 CH 实现的 vsock 设备 host 侧 Unix socket 入口。Forwarder dial vsock.sock 后，先发送连接请求（`CONNECT <port>\n`），指定 guest 侧 vsock 监听端口。CH 收到后通过 **virtio-vsock virtqueue**（共享内存，类似 virtio-net 但完全绕过网络栈）将连接请求推给 guest 内核的 `virtio_vsock` 驱动，驱动交给 guest 内监听该端口的 sandbox-init（serveReverseChannel goroutine）。至此 Forwarder 与 sandbox-init 之间建立了一条双向字节流通道。
 
-*第二层：TypeConnect 帧（Forwarder → guest relay，运行在已建立的 vsock channel 上）*
+*第二层：TypeConnect 帧（Forwarder → sandbox-init，运行在已建立的 vsock channel 上）*
 
-vsock 通道建立后，Forwarder 发送应用层帧 `TypeConnect{Network:"tcp", Address:"127.0.0.1:49983"}`，这是 sandbox-ctl 自定义的 IPC 协议，告诉 guest relay 在 guest 内部 dial 哪个本地服务。relay 收到后 dial `127.0.0.1:49983`（envd），然后在 vsock channel 与这条 TCP 连接之间做字节 relay。
+vsock 通道建立后，Forwarder 发送应用层帧 `TypeConnect{Network:"tcp", Address:"127.0.0.1:49983"}`，这是 sandbox-ctl 自定义的 IPC 协议，告诉 sandbox-init 在 guest 内部 dial 哪个本地服务。sandbox-init 收到后 dial `127.0.0.1:49983`（envd），回 `TypeConnectAck`，双方进入第三层。
+
+*第三层：fwd frame protocol（双方对称，跑在已建立的 vsock channel 上）*
+
+`TypeConnectAck` 之后，双方均启动 `fwd.Relay.Run()`，对 vsock channel 进行带帧的双向搬运。帧格式为 `[type u8][len u16BE][payload]`，三种帧类型：`FrameData` 携带数据字节；`FrameEOF` 带内传递 TCP half-close（触发对端 `CloseWrite()`）；`FrameRST` 中止双向连接。引入帧的原因是 CH 的 vsock proxy 不会把 `shutdown(SHUT_WR)` 跨 UDS↔vsock 边界透传，裸字节 relay 无法保留 TCP half-close 语义。
 
 | 层次 | 参与方 | 协议 | 作用 |
 |------|--------|------|------|
 | 第一层 | Forwarder ↔ CH vsock.sock ↔ guest kernel virtio_vsock | `CONNECT <port>\n` + virtio-vsock virtqueue | 建立 host→guest 虚拟字节流通道 |
-| 第二层 | Forwarder → guest vsock relay（跑在第一层通道内）| `TypeConnect{Network, Address}` | 告知 relay 在 guest 内 dial 哪个本地服务 |
+| 第二层 | Forwarder → sandbox-init（跑在第一层通道内）| `TypeConnect{Network, Address}` / `TypeConnectAck` | 告知 sandbox-init 在 guest 内 dial 哪个本地服务 |
+| 第三层 | Forwarder ↔ sandbox-init（跑在第一层通道内，第二层握手完成后）| fwd frame（FrameData / FrameEOF / FrameRST）| 数据搬运 + TCP half-close 保留 |
 
 > virtio-vsock 与 virtio-net 的区别：virtio-net 传输 Ethernet 帧，经 tap → TC eBPF 进入网络栈；virtio-vsock 传输纯字节流，彻底绕过 guest 和 host 的网络栈，是 sandbox-ctl ↔ guest 之间的专用 IPC 通道。
 
@@ -1535,9 +1559,9 @@ vswitch 只承载网络数据包（IP 层），vsock 是完全独立的 host↔g
 |---------|-----------|----------------|------------|---------|
 | 用户端口（非 49983/49999）本节点 | node-proxy → mg0 → sw-mX TC DNAT → sw0-tN tap → CH virtio-net → guest；回程 sw0-tN SNAT → sw-mX → mg0 → node-proxy | ❌ 不经手 | ✅ mgmt veth + tap | 网络包，走 TC eBPF（DNAT/SNAT）|
 | 用户端口（非 49983/49999）跨节点 | transit NIC GENEVE 解封装 → sw0-tN tap → CH virtio-net → guest；出向 guest → sw0-tN GENEVE 封装 → transit NIC → 外部网关 | ❌ 不经手 | ✅ GENEVE + tap | 网络包，走 TC eBPF（GENEVE 封/解装）|
-| envd/ci 端口（49983/49999）| node-proxy → envd.sock → Forwarder → vsock.sock → CH virtio-vsock → vsock relay → envd | ✅ Forwarder relay | ❌ 不经过 vswitch | virtio-vsock virtqueue，共享内存 |
+| envd/ci 端口（49983/49999）| node-proxy → envd.sock → Forwarder → vsock.sock → CH virtio-vsock → sandbox-init → envd | ✅ Forwarder relay | ❌ 不经过 vswitch | virtio-vsock virtqueue（共享内存）；三层协议：层1 `CONNECT` 建立 vsock 通道，层2 `TypeConnect` 协商目标端口，层3 fwd frame（FrameData/FrameEOF/FrameRST）数据搬运 + TCP half-close 保留 |
 
-vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存），与 vswitch 的 tap 设备、TC eBPF 程序、GENEVE 隧道完全无关。两者是并行的两套 host↔guest 通道，面向不同用途：vswitch tap 承载对外可路由的网络流量（用户端口，sandbox-ctl/Forwarder 全程不参与），vsock 承载 sandbox-ctl 与 guest 之间的内部 IPC（含 envd/ci 数据面 relay，Forwarder 做两层协议 relay）。
+vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存），与 vswitch 的 tap 设备、TC eBPF 程序、GENEVE 隧道完全无关。两者是并行的两套 host↔guest 通道，面向不同用途：vswitch tap 承载对外可路由的网络流量（用户端口，sandbox-ctl/Forwarder 全程不参与），vsock 承载 sandbox-ctl 与 guest 之间的内部 IPC（含 envd/ci 数据面 relay，Forwarder 做三层协议 relay：层1 vsock 通道建立、层2 TypeConnect 服务协商、层3 fwd frame 数据搬运）。
 
 ---
 
@@ -1585,8 +1609,8 @@ vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存）
 - **ApplyDelete 解除挂起**：收到 `delete` 帧时，`notifyLocked(sid)` 立即解除该 sid 所有 `waiters`，Resolve 返回 err，防止孤儿 goroutine。
 - **全量同步孤儿清理**：`bookmark` 收到后，删除本次同步未出现的路由条目，防止路由表与 serve 状态永久分叉。
 - **MMDS token 无状态**：token = `sid + "." + hex(HMAC-SHA256(mmds_secret, sid))`，确定性计算，无存储、无 TTL；token 泄露风险由 mmds_secret 轮换（sandbox 销毁）覆盖。
-- **Forwarder 快照静默期保护**：快照（pause）开始前 `Forwarder.Pause()` 阻止新连接进入 envd.sock/ci.sock，`CloseActive()` 折叠所有活跃 vsock relay（层1通道 + 层2字节流一并关闭），保证快照窗口内不存在半开的 vsock 连接；快照完成后 `Resume()` 重新开放监听。防止快照期间 relay goroutine 持有 vsock channel 导致 VM 状态不一致。
-- **sandbox-ctl cgroup 隔离防死锁**：当前（`--cgroup-adopt`）sandbox-ctl 与 CH 同处 systemd unit cgroup；`memory.high` 节流时 Forwarder relay goroutine（层1 virtqueue 写入 + 层2 io.Copy）可能被一并卡住，造成整条 `node-proxy ↔ Forwarder ↔ CH virtio-vsock ↔ vsock relay ↔ envd` 链路死锁；该风险当前已知并接受。计划（`--cgroup-isolated`，未实现）：sandbox-ctl 留在 unit cgroup，CH 移入子 cgroup `<unit-cgroup>/sandbox-<sid>/`；`memory.high` 仅节流 CH，sandbox-ctl 可随时发出 balloon inflate 命令解压；`KillMode=control-group` 覆盖整个子树，CH 不会因 sandbox-ctl 退出而成为孤儿。
+- **Forwarder 快照静默期保护**：快照（pause）开始前 `Forwarder.Pause()` 阻止新连接进入 envd.sock/ci.sock，`CloseActive()` 折叠所有活跃 sandbox-init relay 连接（层1通道 + 层2字节流一并关闭），保证快照窗口内不存在半开的 vsock 连接；快照完成后 `Resume()` 重新开放监听。防止快照期间 relay goroutine 持有 vsock channel 导致 VM 状态不一致。
+- **sandbox-ctl cgroup 隔离防死锁**：当前（`--cgroup-adopt`）sandbox-ctl 与 CH 同处 systemd unit cgroup；`memory.high` 节流时 Forwarder relay goroutine（层1 virtqueue 写入 + 层2 io.Copy）可能被一并卡住，造成整条 `node-proxy ↔ Forwarder ↔ CH virtio-vsock ↔ sandbox-init ↔ envd` 链路死锁；该风险当前已知并接受。计划（`--cgroup-isolated`，未实现）：sandbox-ctl 留在 unit cgroup，CH 移入子 cgroup `<unit-cgroup>/sandbox-<sid>/`；`memory.high` 仅节流 CH，sandbox-ctl 可随时发出 balloon inflate 命令解压；`KillMode=control-group` 覆盖整个子树，CH 不会因 sandbox-ctl 退出而成为孤儿。
 - **tap fd TUNSETPERSIST 防用户端口中断**：用户端口数据面路径（`vswitch tap → CH virtio-net → guest`）与 sandbox-ctl 完全解耦。cloud-hypervisor 崩溃时 tap fd 引用计数归零，字符设备端关闭；但 sw0-tN 因 `TUNSETPERSIST(1)` 仍留在 switch netns，下次 CH 重启时 `vswitch-ctl open-port` 重新交接新 fd，用户端口数据面可自愈，无需重建 vswitch 端口或重写 eBPF flowtable 条目。
 
 ### 6.3 过载控制
