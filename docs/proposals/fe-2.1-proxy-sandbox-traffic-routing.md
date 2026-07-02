@@ -1060,6 +1060,83 @@ type RouteEntry struct {
         → [计划中，proxy 当前代码尚未实现] 409 + X-Migration-Token: <migration_token>
 ```
 
+### 4.4.1 透明转发的 envd 接口清单
+
+> proxy 按 `(sid, port)` 路由，**不解析 HTTP 路径**，不区分 gRPC 和 REST。
+> 以下接口均由 guest 内 envd 实现，proxy 层只做认证（X-Access-Token）+ 路由 + 透传。
+>
+> **实际能力由 guest 内 envd daemon 的版本决定**：下表列出的是当前版本 envd 实现的接口集合。node-ctl proxy 对路径无感知，接口的增删、行为变更、版本迭代均由 envd 二进制决定，proxy 无需跟随修改。不同模板镜像内置的 envd 版本不同，同一 node-ctl 节点上运行的不同沙箱可能暴露不同的接口子集，调用方需根据实际 envd 版本判断能力边界。
+
+#### port 49983 — envd（仅 e2b profile）
+
+envd 以 chi.Mux 为底层路由器，同时挂载 Connect-RPC handler 和 oapi-codegen 生成的 REST handler，监听 guest 内 `127.0.0.1:49983`；通过 sandbox-ctl vsock 反向通道穿透到 host 侧 `envd.sock`。
+
+**协议兼容性**
+
+proxy HTTP 链路两端非对称：
+
+| 链路段 | 协议 | 实现依据 |
+|--------|------|---------|
+| 客户端 → proxy | HTTP/2（无 TLS 时 h2c；有 TLS 时 ALPN 协商）| `netserve.go:36` `h2c.NewHandler` / `TLSConfig.NextProtos: ["h2", "http/1.1"]` |
+| proxy → envd | HTTP/1.1 | `proxy.go:109` `ForceAttemptHTTP2: false` |
+
+| 客户端协议 | 可用性 | 原因 |
+|-----------|--------|------|
+| **Connect 协议**（`application/connect+proto`，e2b SDK 默认）| ✅ 完整可用 | Connect 协议设计即兼容 HTTP/1.1 后端；unary / server-stream / client-stream 均正常 |
+| **gRPC-Web 协议**（`application/grpc-web`）| ✅ 可用 | trailer 编码在 response body 内，不依赖 HTTP/2 trailer 帧 |
+| **gRPC 协议**（`application/grpc`）| ❌ 不可用 | gRPC 要求端到端 HTTP/2；proxy→envd 降为 HTTP/1.1 后 `grpc-status` trailer 丢失，envd 亦拒绝 HTTP/1.1 上的 `application/grpc` 请求 |
+
+**Connect-RPC 接口**（Connect 协议 / gRPC-Web 协议可用；gRPC 协议不可用）
+
+| 路径 | 流式方向 | 说明 |
+|------|---------|------|
+| `/process.Process/List` | Unary | 列举 guest 内所有受管进程 |
+| `/process.Process/Connect` | Server-stream | attach 到已有进程，服务端推送 stdout/stderr/exit 事件；stdin 输入须通过 `SendInput`/`StreamInput` 独立发送 |
+| `/process.Process/Start` | Server-stream | 启动新进程，stdout/stderr/exit 事件以 stream 返回 |
+| `/process.Process/SendInput` | Unary | 向进程 stdin 写入数据 |
+| `/process.Process/StreamInput` | Client-stream | 客户端流式写入 stdin；经 HTTP/1.1 chunked request body 透传，语义正确 |
+| `/process.Process/SendSignal` | Unary | 向进程发送 Unix 信号 |
+| `/process.Process/CloseStdin` | Unary | 关闭进程 stdin（发送 EOF）|
+| `/process.Process/Update` | Unary | 更新进程元数据（超时、标签等）|
+| `/filesystem.Filesystem/Stat` | Unary | 查询路径属性（类型、大小、mtime）|
+| `/filesystem.Filesystem/MakeDir` | Unary | 创建目录（含 mkdir -p）|
+| `/filesystem.Filesystem/Move` | Unary | 移动/重命名文件或目录 |
+| `/filesystem.Filesystem/Remove` | Unary | 删除文件或目录 |
+| `/filesystem.Filesystem/ListDir` | Unary | 列举目录内容 |
+| `/filesystem.Filesystem/WatchDir` | Server-stream | 监听目录变更事件（inotify 封装），长连接推送 |
+| `/filesystem.Filesystem/CreateWatcher` | Unary | 创建目录监听器，返回 watcher handle |
+| `/filesystem.Filesystem/GetWatcherEvents` | Unary | 轮询获取指定 watcher 的事件列表 |
+| `/filesystem.Filesystem/RemoveWatcher` | Unary | 销毁 watcher，释放 inotify 资源 |
+
+> `Start`、`Connect`、`WatchDir` 等 server-stream RPC：proxy 设置 `FlushInterval: -1`（`proxy.go:128`），每个响应帧立即下发，不在 proxy 层缓冲。
+
+**REST 接口（HTTP/1.1 或 HTTP/2，oapi-codegen 生成）**
+
+| 方法 + 路径 | 说明 |
+|------------|------|
+| `GET  /files` | 文件下载；`path` query param 指定 guest 内绝对路径 |
+| `POST /files` | 文件上传；支持 `multipart/form-data` 多文件或 `application/octet-stream` 单文件（xattr `user.e2b.*` 存储元数据）|
+| `POST /files/compose` | 多文件合并写入目标路径，底层使用 `copy_file_range` 内核零拷贝；写临时文件后原子 rename，避免中途失败破坏目标文件 |
+| `GET  /envs` | 返回 guest 内当前生效的环境变量键值表 |
+| `GET  /health` | 健康探针（`{"status":"ok"}`）；sandbox-ctl 在 VM 启动后直接调此接口确认 envd 就绪，亦可通过 proxy 透传 |
+| `POST /init` | envd re-key：接受 MMDS 颁发的 `accessToken`，仅在 `mmds.enabled=true` 时生效 |
+| `POST /freeze` | 冻结 guest 内所有受管进程组（pause 前调用）|
+| `POST /unfreeze` | 解冻（resume 后调用）|
+| `POST /fsfreeze` | 冻结 guest 内文件系统写入（暂停 I/O）|
+| `POST /fsthaw` | 解冻文件系统 |
+| `POST /collapse` | 压缩 envd 自身堆内存（将匿名页合并为 2 MiB 透明大页），pause 快照前调用以减少脏页数量 |
+| `GET  /metrics` | 返回 guest 内主机资源快照（JSON）：CPU 核数/使用率、内存总量/已用/缓存、磁盘总量/已用；数据来自 `/proc/stat` 和 `/proc/meminfo`，是 guest 整机视图，不区分进程（envd 自身占用包含在内，无法单独分辨）|
+
+**认证拆分**：proxy 在 `AuthMiddleware` 校验 `X-Access-Token`，通过后透传；envd `auth.go` 的 bypass 列表仅包含 `GET /files` 和 `POST /files`，其余路径（含 `POST /files/compose`）envd 侧仍会做自身校验。
+
+#### port 49999 — code-interpreter（仅 e2b profile）
+
+code-interpreter 进程监听 `127.0.0.1:49999`，通过 `ci.sock` 穿透到 host。proxy 按 `port == 49999 → KindUDS(ci.sock)` 路由，接口内容由 code-interpreter 自身定义，proxy 不感知。
+
+#### 其他端口 — 用户自定义服务（TCP，floatingIP 路由）
+
+`port ∉ {49983, 49999}` → `KindTCP → floatingIP:port`，由 vswitch DNAT 到 guest 内对应服务，proxy 不做协议解析。bare profile 访问 49983/49999 → `KindDeny(501 Not Implemented)`。
+
 ### 4.5 eBPF flowtable 集成（计划中，proxy 当前代码尚未实现）
 
 > **注**：`internal/proxy/` 当前版本中不存在 `FlowTableWriter`、`bpf_map_update_elem` 等实现。以下为设计规格，待实现后生效。现阶段用户端口全程由 node-proxy io.Copy 双向 splice 承运。
@@ -1571,22 +1648,22 @@ vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存）
 
 | 路径 | P50 | P99 | 说明 |
 |------|-----|-----|------|
-| running 沙箱新连接建立（TLS + 路由查表 + splice 建立）| < 10 ms | < 50 ms | 主要消耗在 TLS 握手 |
-| paused 沙箱 wake 延迟（park 开始到 splice 建立）| < 2 s | < 30 s | 受 resume（快照恢复）P99 主导 |
-| 路由表查表（sync.Map Lookup）| < 100 ns | < 500 ns | O(1) hash map |
-| flowtable 写入（bpf_map_update_elem）| < 1 µs | < 5 µs | 内核 syscall |
-| 已建连接 TC hook 转发（字节级吞吐）| 接近 NIC 线速 | — | eBPF 内核旁路，绕过 node-proxy |
-| routesync 增量 upsert 应用延迟 | < 1 ms | < 5 ms | JSON 解码 + sync.Map Store |
-| MMDS session token 颁发 | < 1 ms | < 5 ms | HMAC 计算（确定性，无存储）|
+| running 沙箱新连接建立（TLS + 路由查表 + splice 建立）| < 10 ms | < 50 ms | **部分实测**：node-proxy 自身处理（loopback keep-alive）268 µs；loopback 新建 TLS 连接（RSA 2048 自签名）4.5 ms；真实部署另加网络 RTT（数据中心内 ~0.5–2 ms）及 TLS session ticket 复用影响；端到端 P50/P99 需在实际部署中标定 |
+| paused 沙箱 wake 延迟（park 开始到 splice 建立）| < 2 s | < 30 s | **估算**：受 resume（快照恢复）P99 主导，实际值取决于快照大小与存储速度 |
+| 路由表查表（sync.Map Lookup）| ~51 ns | < 500 ns | **实测**：并发 benchmark Xeon E5-2680 v4，命中 51 ns/miss 19 ns；P99 含争用估算 |
+| flowtable 写入（bpf_map_update_elem）| < 1 µs | < 5 µs | **估算**：syscall 开销约 100–300 ns + BPF LRU hash 更新，待 benchmark |
+| 已建连接 TC hook 转发（字节级吞吐）| 接近 NIC 线速 | — | eBPF 内核旁路，绕过 node-proxy 用户态 |
+| routesync 增量 upsert 应用延迟（纯 CPU）| ~12 µs | — | **实测**：JSON decode 11.5 µs + sync.Map Store 51 ns；端到端含 UDS 传输，待 benchmark |
+| MMDS session token 颁发（HMAC 计算）| ~2.5 µs | — | **实测**：HMAC-SHA256 benchmark；含 HTTP handler 开销端到端待实测 |
 
 ### 容量分析
 
 | 维度 | 单节点目标 | 说明 |
 |------|-----------|------|
-| 并发沙箱数 | 4096 | 路由表 4096 条 sync.Map 条目，内存 < 10 MiB |
-| 并发 TCP 连接数 | > 10 万 | Go goroutine per-conn，8 KiB 栈 ≈ 800 MiB；受 ulimit 和内存限制 |
-| park 队列（全部 paused 同时唤醒）| 4096 × 若干连接 | park goroutine 轻量；超时后自动回收 |
-| routesync 全量同步时间（4096 条）| < 500 ms | 单次 JSON 帧约 1 KiB，4 MiB 总量，loopback h2c 传输极快 |
+| 并发沙箱数 | 4096 | vswitch BPF 编译常量 `MAX_PORTS=4096`（`bpf/types.go`）硬上限；路由表 sync.Map 跟随，内存 < 10 MiB |
+| 并发 TCP 连接数 | ~1 万 | per-conn 用户态：2 goroutine × 初始栈 2 KiB（`runtime/stack.go stackMin=2048`，Linux）+ 2 × io.Copy 堆缓冲 32 KiB（`io/io.go:418`）= 68 KiB；内核态：用户端口（TCP→TCP）两侧各 tcp_rmem default 128 KiB + tcp_wmem default 16 KiB = 288 KiB，envd/ci（TCP→UDS）TCP 侧 144 KiB + UDS 侧 core/[rw]mem_default 208 KiB = 352 KiB；用户端口合计约 356 KiB/conn，envd/ci 约 420 KiB/conn；按最贵路径 420 KiB × 1万 ≈ 4 GiB proxy 内存预算（节点 16 GiB）推算 |
+| park 队列（全部 paused 同时唤醒）| per-sid 无硬上限 | 每个 waiter：1 goroutine（初始栈 2 KiB）+ chan struct{}{1} header ~96 B ≈ 2 KiB；waiter 数 = 流量速率 × park_timeout，park_timeout 到期后自动回收；最多 4096 个 sid 同时唤醒 |
+| routesync 全量同步时间（4096 条）| < 500 ms（估算，待 benchmark 验证）| 单条 upsert Msg JSON 实测 461 B，4096 条合计 ~1.80 MiB；Range 遍历期间逐条 WriteMsg 不 flush，Bookmark 后一次性 flush；传输层为 UDS h2c（非 loopback TCP），内核 copy 无网络延迟 |
 
 ---
 
