@@ -199,7 +199,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  │  沙箱状态机 running / paused / dead    │    │      │  ┌─ HostRouter ──────────────────────────────────┐  │ │
 │  │  │  Reconcile(对账收养) / Reaper(5s)     │    │      │  │  Host → (sid, port)                            │  │ │
 │  │  │  BuildPool(2s) / StreamAuthority      │    │      │  │  支持 <port>-<sid>.<domain>                    │  │ │
-│  │  └───────────────────────────────────────┘    │      │  │  支持 E2b-Sandbox-Id header                    │  │ │
+│  │  └───────────────────────────────────────┘    │      │  │  支持 E2b-Sandbox-Id / E2b-Sandbox-Port header  │  │ │
 │  │                                               │      │  └──────────────────────────────────────────────┘  │ │
 │  │  ┌─ resource controller ─────────────────┐    │      │  ┌─ RouteTable (sync.Map, O(1)) ─────────────────┐  │ │
 │  │  │ [resource_listen.socket UDS]          │    │      │  │ sid → RouteEntry {                             │  │ │
@@ -754,7 +754,7 @@ node-ctl.service
 | 模块 | 职责 |
 |------|------|
 | `TLSListener` | 监听 `--data-listen`（SO_REUSEPORT），TLS 握手，Accept 循环 |
-| `HostRouter` | 解析 HTTP Host header，提取 `(sid, port)`；支持 `<port>-<sid>.<domain>` 和 `E2b-Sandbox-Id` 两种寻址 |
+| `HostRouter` | 解析 HTTP Host header，提取 `(sid, port)`；支持两种寻址：① Host label `<port>-<sid>.<domain>`；② header 对 `E2b-Sandbox-Id`（sid）+ `E2b-Sandbox-Port`（port，缺省 49983）|
 | `RouteTable` | 本地路由表（`sync.Map[sid → RouteEntry]`）；`ApplyUpsert`、`ApplyDelete`、`Lookup`；`Resolve(ctx, sid, port)` 内部实现 park/wake：paused 时挂起在 `waiters[sid] chan struct{}`，同时调 `Table.Wake(sid)` 写 wakeCh；`notifyLocked(sid)` 在 ApplyUpsert/Delete 时解除挂起；`pending map[string]bool` 防止同 sid 重复发 wake 帧 |
 | `Dispatcher` | 按 (sid, port, state) 路由到目标：UDS splice / TCP splice / park；e2b profile port 49983/49999 → KindUDS；bare profile 访问此二端口 → KindDeny(501)；其他端口 → KindTCP；UDS 目标为 sandbox-ctl Forwarder 持有的 host 侧 UDS，每条连接经 vsock 反向通道穿透到 guest 内 envd/ci 进程 |
 | `RouteSyncClient` | config-socket plugin 平面 h2c 客户端；register 帧作为请求 body 发出（首帧），服务端回 hello 后再推全量 upsert + bookmark；增量订阅；指数退避重连 |
@@ -1036,6 +1036,7 @@ type RouteEntry struct {
     │   未命中 → 404 Not Found
     │
     ├─ AuthMiddleware（auth_mode=enforce）
+    │   route.AccessToken == "" (bare profile) → 跳过校验，直接放行（无认证保护）
     │   X-Access-Token ≠ route.AccessToken → 401 Unauthorized
     │
     ├─ route.State == "running"
@@ -1236,6 +1237,8 @@ node-proxy 本身不暴露控制面 REST API；其对外接口是 **HTTPS 数据
 | Saved 沙箱（跨机）| 同上，state=saved | **新增** 409 + `X-Migration-Token` header |
 | 沙箱不存在 | 同上 | 404（现有行为，已有） |
 
+**数据面认证**：proxy 对 `X-Access-Token` 支持 `off / log / enforce` 三档（默认 enforce）。bare profile 无 envd，路由表 `AccessToken == ""`，proxy 无论哪档均跳过 token 校验，数据面请求**无认证保护**；e2b profile 有 access token，enforce 模式下 token 不匹配返回 401。
+
 服务级别：P99 连接建立延迟（running 沙箱）< 50 ms；吞吐量峰值受限于宿主机 NIC 带宽（不受 node-proxy 用户态限制）。
 
 #### 4.8.2 周边 API 调用变更
@@ -1249,6 +1252,62 @@ node-proxy 本身不暴露控制面 REST API；其对外接口是 **HTTPS 数据
 | guest envd → proxy | MMDS v2 HTTP `169.254.169.254:80` → `127.0.0.1:19254`（vswitch DNAT）| 新增 MMDS sidecar，接口协议已有定义 |
 
 **过载风险评估**：routesync 为 push 模型，serve 主动推送增量变更，proxy 本地查表 O(1)，无额外 RPC 调用在热路径上；flowtable 写入为内核调用，延迟 < 1 µs；整体热路径不引入新的外部依赖过载风险。
+
+#### 4.8.3 上游调用方接入约定
+
+node-ctl proxy 上游通过 `--data-listen`（TCP）接入，比如：集群入口 `cluster-ctl route` 和集群级网关 `agent-gateway`。他们的连接方式相同，区别在于沙箱寻址方式不同。
+
+**上游入口示意**
+
+```
+client
+  │
+  ├─── cluster-ctl route ──────────────────────────→ --data-listen (TCP)  ─┐
+  │     集群级入口；解析 sid → DataEndpoint；注入 X-Access-Token             │
+  │     Host / port 由 client 指定，route 原样透传                           ├─→ node-ctl proxy → guest
+  │                                                                          │
+  └─── agent-gateway ──────────────────────────────→ --data-listen (TCP) ─┘
+        集群级网关；本地 sid→node map 查表定位目标节点；
+        透传 E2b-Sandbox-Id / E2b-Sandbox-Port / X-Access-Token
+        port 由调用方通过 E2b-Sandbox-Port 指定（缺省 49983）
+```
+
+**设计约定：port 由 client 指定，cluster-ctl route / agent-gateway 负责透传**
+
+`Host: <port>-<sid>.<domain>`、`E2b-Sandbox-Id`、`E2b-Sandbox-Port` 均由**客户端用户**在请求中指定：
+
+- **cluster-ctl route**：Host label 路径直接透传客户端 Host；by-(group, route-key) 路径读取客户端的 `E2b-Sandbox-Port`（缺省 49983）拼入 Host label 后转发
+- **agent-gateway**：原样透传 `E2b-Sandbox-Id` / `E2b-Sandbox-Port`
+- 若客户端未指定 port，两者均以 **49983**（envd 入口）作为缺省值
+- port 合法性由 node-ctl proxy 在路由决策时保证（KindDeny / KindTCP / KindUDS 分类）
+
+**cluster-ctl route 对 proxy 的要求**
+
+| 项 | 说明 |
+|----|------|
+| 连接端点 | proxy 的 `--data-listen`（TCP，SO_REUSEPORT） |
+| 沙箱寻址 | `Host: <port>-<sid>.<domain>`（router 解析 sid 后保持 Host 原样） |
+| 认证注入 | `X-Access-Token: <token>`（router 从 registry 取 access_token 后注入） |
+| Transport | HTTP/1.1 keepalive（`MaxIdleConns:512, MaxIdleConnsPerHost:64, IdleConnTimeout:90s`）；proxy 须接受复用连接 |
+| CONNECT 隧道 | router 发送 `CONNECT <port>-<sid>.<domain> HTTP/1.1` + `X-Access-Token`；proxy 须处理 CONNECT 并双向 splice |
+
+**agent-gateway 对 proxy 的要求**
+
+agent-gateway 持有 `sid → node` 映射，收到请求后直接查表定位目标节点，无需回查 registry，转发到该节点的 `--data-listen`。
+
+| 项 | 说明 |
+|----|------|
+| 连接端点 | 目标节点 proxy 的 `--data-listen`（TCP，SO_REUSEPORT） |
+| 路由依据 | 本地 `sid → node` map 查表，直接命中目标节点 |
+| 沙箱寻址 | header 对 `E2b-Sandbox-Id`（sid）+ `E2b-Sandbox-Port`（port，缺省 49983） |
+| 认证透传 | `X-Access-Token` 原样透传 |
+| CONNECT 隧道 | 发送 `CONNECT <target> HTTP/1.1` + `E2b-Sandbox-Id` + `E2b-Sandbox-Port` + `X-Access-Token`；proxy 须处理链式 CONNECT |
+
+**proxy 须同时满足的能力点**
+
+1. `ParseSandbox()` 优先读 `E2b-Sandbox-Id`，fallback 到 Host label，两类上游均可正确解析 `(sid, port)`。
+2. `X-Access-Token` 鉴权对两类上游统一执行。
+3. CONNECT 隧道（`serveConnect`）在 HTTP/1.1 和 HTTP/2 两种协议下均能正常 splice。
 
 ### 4.9 数据库设计
 
