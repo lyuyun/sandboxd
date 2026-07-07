@@ -551,6 +551,7 @@ sequenceDiagram
         SC->>SC: pinger.Start + BalloonController.Start<br>hooks.SettledRestore（写 memory.high）
         O->>E: poll /health（仅 e2b）
         E-->>O: 200 OK
+        O->>E: POST /init（env + token，仅 e2b + MMDS 启用）
         O->>DB: SetState(running)+SetDeadline
         O->>P: publishUpsert(running)
     end
@@ -1018,7 +1019,7 @@ sequenceDiagram
 | 成功销毁 / pause / timeout | 204 | DELETE, POST pause/timeout |
 | build 文件检查成功 | 201 | GET /templates/{tid}/files/{hash} |
 | API key 格式非法 | 401 | 所有受保护端点（auth 中间件） |
-| 请求体格式错误 / export-import 业务失败 | 400 | POST /sandboxes（bad body）、/timeout（bad body）、/import（token 缺失）、/connect 或 /export 带 migration token 时 |
+| 请求体格式错误 / 入参校验失败 / export-import 业务失败 | 400 | POST /sandboxes（bad body）、/timeout（bad body）、/import（token 缺失）、/connect 或 /export 带 migration token 时、POST /v2/templates/.../builds/...（bad body 或 COPY 上下文未上传）|
 | 沙箱不存在或租户不匹配 | 404 | 所有带 {id} 端点 |
 | manifest key 不在白名单 | 403 | POST /sandboxes、/export、/import 及 build 端点 |
 | 已是 paused 状态 | 409 | POST /sandboxes/{id}/pause |
@@ -1255,7 +1256,7 @@ sequenceDiagram
 | 传递方式 | Header | 使用场景 |
 |---------|--------|---------|
 | API key（主要）| `X-API-KEY: <api_key>` | e2b SDK 默认（`E2B_API_KEY` 环境变量） |
-| Bearer token（兼容）| `Authorization: Bearer <api_key>` | e2b CLI 使用（模板/账号类端点） |
+| Bearer token（兼容）| `Authorization: Bearer <api_key>` | e2b CLI 使用（模板/构建端点，账号类端点不在此服务器） |
 
 两种方式都取出同一字符串走相同的验证逻辑；`Authorization: Bearer` 仅当 `X-API-KEY` 缺失时生效。
 
@@ -1295,6 +1296,10 @@ e2b SDK 对 api_key 格式校验：`/^e2b_[0-9a-f]+$/`（前缀 + 小写 hex）�
 
 ##### Manifest Key 生命周期
 
+Manifest key 注册到节点有两条路径：
+
+**路径 A — 手动注册（单机模式 / 集群节点均适用）**
+
 ```
 # 1. 生成 manifest key（运营方保存，不出内网）
 e2b-key-ctl gen-key
@@ -1305,8 +1310,12 @@ e2b-key-ctl gen-apikey <manifest_key>
   → e2b_<72hex>（共 76 字符）
 
 # 3. 注册到节点白名单（只有白名单 key 能创建沙箱 / 触发构建）
-node-ctl manifest-key add <manifest_key> [--label <name>] [--ttl <duration>]
+node-ctl manifest-key add <manifest_key> [--label <name>] [--ttl <duration>] \
+    [--registry-auth <config.json>]          # 直接传 docker config.json 文件
+    [--registry-username/--registry-password] # 或 用户名/密码（自动组装 config.json）
+    [--registry-token <token>]               # 或 bearer token
 # --ttl 接受 Go duration 格式，如 24h、168h；0 或缺省 = 永不过期
+# registry 参数写入 registry_auth_enc（AES-256-GCM），用于租户默认镜像拉取凭据
 
 # 4. 查询 / 检查 / 删除
 node-ctl manifest-key list
@@ -1314,17 +1323,80 @@ node-ctl manifest-key check <manifest_key>   # 输出 present / absent
 node-ctl manifest-key remove <manifest_key>
 ```
 
+**路径 B — 集群自动分发（cluster 模式，registry 主动推送）**
+
+registry 为每个配置了 `ManifestKey` 的 group 维护 key 租约，通过 `CmdKeyPut` 命令推送到该 group 的**分配集**（allocation set）节点：
+
+**reconcileKeys 触发时机**（三种，均收敛到同一函数）：
+
+```
+registry.RunKeyDistributor（由 cluster-ctl registry 启动）
+  ├─ 启动时立即执行一次 reconcileKeys
+  ├─ 每 keyRenewEvery = 1h ticker 触发
+  └─ 节点接入时 onNodeConnected → reconcileTrigger（chan size=1，多节点同时接入合并为一次）
+```
+
+**reconcileKeys 逻辑**（每次完整扫描所有 group）：
+
+```
+// 阶段 1：持锁收集 ops，同时更新 keyLeased（send block 不影响锁）
+for each group with ManifestKey != "":
+    want = allocationSet(group)          // 当前应持有 key 的节点集
+    have = keyLeased[group]              // 上次 reconcile 时的集合（内存）
+    for nodeID ∈ want:      ops += KeyPut{nodeID, ManifestKey, ExpiresUnix=now+3h}
+    for nodeID ∈ have ∖ want: ops += KeyDrop{nodeID, KeyFingerprint}
+    keyLeased[group] = want              // 释放锁前更新快照
+
+// 阶段 2：锁外批量发送（wedged node 不阻塞其他 group/node）
+for each op ∈ ops:
+    if op.drop: send CmdKeyDrop{KeyFingerprint}   // 节点离开分配集时撤销
+    else:       send CmdKeyPut{ManifestKey, ExpiresUnix}  // install 或 renew，upsert 语义
+```
+
+> install 和 renew 走同一 `CmdKeyPut` 路径，无区分——每次 reconcile 对所有 want 节点都发（幂等 upsert）。
+
+**allocationSet 计算**：
+
+```
+selectors = group.NodeSelectors
+if scaler 已推送 shuffle-effective selectors for this group:
+    selectors = effectiveSelectors      // 覆盖静态 nodeSelectors
+                                        // 使 key 只分发到 shuffle-pinned 节点
+
+for each connected node n:
+    if matchAnySelector(n.Labels, selectors):   // OR over selectors; AND within one
+        set += n
+// selectors 为空 → 匹配所有已连接节点
+```
+
+**节点侧处理**：
+
+```
+CmdKeyPut{ManifestKey, ExpiresUnix}
+  → st.AddManifestKey(ctx, key, label="cluster", ttl=ExpiresUnix-now, "")
+    // upsert：已存在则刷新 expires_unix
+
+CmdKeyDrop{KeyFingerprint}
+  → dropClusterKey(fingerprint):
+      keys = st.AllowedManifestKeysByHash(fingerprint)  // 按 fp 查有效行
+      for each key: st.RemoveManifestKey(key)           // 显式删除
+    // 备选路径：key 不续约则 TTL 自然到期，AllowedManifestKeysByHash 自动排除
+```
+
+租约 TTL 为 3 小时（`keyLeaseTTL`），registry 每小时续约（TTL 窗口内至少续约 2 次），到期未续约的行由 `AllowedManifestKeysByHash` 查询时自动排除（不再授权创建），`PruneExpiredManifestKeys` 由 Reaper 每 5s 惰性清理实际行。
+
+---
+
 白名单表 `manifest_keys` 字段：
 
 | 字段 | 说明 |
 |------|------|
 | `key_hash` | `hex(SHA256(key)[:12])`，非唯一索引（同前缀可碰撞，MAC 二次确认） |
 | `key_enc` | AES-256-GCM 密文 |
-| `label` | 可读名称（可选）|
+| `label` | 手动注册时为运营方指定名称；集群分发时固定为 `"cluster"` |
 | `created_unix` | 添加时间 |
-| `expires_unix` | 过期时间；`0` = 永不过期 |
-
-运营方可通过 `--ttl` 设置有效期（`--ttl 24h` 等 Go duration）；`AllowedManifestKeysByHash` 查询时已排除过期行，`PruneExpiredManifestKeys` 由 Reaper 每 5s 惰性清理实际行。
+| `expires_unix` | 过期时间；`0` = 永不过期（手动注册默认）；集群分发为 `now + 3h` |
+| `registry_auth_enc` | 租户默认镜像拉取凭据（docker config.json），AES-256-GCM 加密；未设置时为空串 |
 
 ##### 认证流程
 
@@ -1333,34 +1405,38 @@ node-ctl manifest-key remove <manifest_key>
 **阶段一：格式校验（`auth` 中间件，所有受保护端点）**
 
 ```
-X-API-KEY: <token>
+X-API-KEY: <token>            ← 优先
+Authorization: Bearer <token> ← 回退（X-API-KEY 缺失时，供 template/build 端点使用）
   └─► apikey.Parse(token)
         ├─ 检查 "e2b_" 前缀
         ├─ hex 解码 + 长度校验（36 字节）
         ├─ 拆分 fp / ts / nonce / mac
         ├─ 格式合法 → api key 存入 request context，放行
-        └─ 格式非法 → 401 {"message": "unauthorized"}
+        └─ 格式非法（含两个 header 均缺失）→ 401 {"message": "unauthorized"}
 ```
 
 此阶段**不做 MAC 验证**（不需要 manifest key，O(1) 完成）。
 
 **阶段二：MAC 验证（handler 层，按操作语义分两种路径）**
 
-*路径 A — 白名单模式（Create / RegisterBuild）*：要求 api key 归属于已添加白名单的 manifest key。
+*路径 A — 白名单模式（Create / RegisterBuild / ImportSandbox）*：要求 api key 归属于已添加白名单的 manifest key。ImportSandbox 等同于"从 migration token 创建新沙箱"，同样走此路径而非路径 B（无现有沙箱归属可验证）。
 
 ```
 resolveAllowed(ctx, apiKey):
   1. 取 fp = apiKey.FP（12字节）
   2. store.AllowedManifestKeysByHash(hex(fp))
        → 按 key_hash 索引查 manifest_keys（有效期内）→ 候选集
-  3. for each candidate mk:
-       apikey.Verify(p, mk)  // 常数时间 HMAC 比较
+  3. for each candidate mk（hex 字符串）:
+       raw = hex.Decode(mk)
+       apikey.Verify(p, raw)  // FP 指纹比较 + 常数时间 HMAC 比较
        match → return mk
   4. 无匹配 → return ""
-  创建调用：manifestKey == "" → 403
+  // 调用方各自处理空串：
+  // Create / RegisterBuild：manifestKey == "" → api.ErrNotAllowed → a.fail → 403
+  // ImportSandbox：mk == "" → fmt.Errorf("tenant key not on this node…") → a.failMigrate → 400
 ```
 
-*路径 B — 归属验证模式（Get / Kill / Pause / Connect / Timeout / Export）*：要求 api key 与沙箱行存储的 manifest key 一致。
+*路径 B — 归属验证模式（Get / Kill / Pause / Connect / Timeout / Export / TriggerBuild / BuildStatus / FilesUpload / ListTemplates）*：要求 api key 与资源行存储的 manifest key 一致（沙箱操作用 `ownsSandbox`，build 操作用 `ownsBuild`，底层均为同一 `verifyKey`；ListTemplates / List 端点同模式做 per-row `verifyKey` 过滤）。
 
 ```
 st.Get(ctx, id) → sb
@@ -1368,11 +1444,14 @@ st.Get(ctx, id) → sb
 ownsSandbox(sb, apiKey):
   verifyKey(apiKey, sb.ManifestKey)  // apikey.Parse + HMAC-SHA256 验证
   ├─ 匹配 → 继续
-  └─ 不匹配或 sb==nil → 404  // 不泄露沙箱是否存在
+  └─ 不匹配或 sb==nil:
+       Get / Kill / Pause / Connect / Timeout → api.ErrNotFound → a.fail → 404
+       Export → fmt.Errorf("...") → a.failMigrate → 400
+         // Export 为运营工具，返回具体错误；沙箱不存在时同样返回 400
 ```
 
 > **租户隔离**：
-> - 路径 B 统一返回 404（不区分"不存在"与"他人的沙箱"），防止 id 枚举攻击。
+> - 路径 B 绝大多数端点统一返回 404（不区分"不存在"与"他人的沙箱"），防止 id 枚举攻击；Export 例外——`!ownsSandbox` 返回 `fmt.Errorf` 而非 `api.ErrNotFound`，经 `failMigrate` 映射为 400。
 > - List 端点两层过滤：① DB 层按 `manifest_key_hash = hex(apiKey.FP)` 预过滤（非唯一索引，SHA256 前缀碰撞时可能命中他人行）；② `orch.List` 对每行调 `verifyKey(apiKey, sb.ManifestKey)` 做 MAC 验证，静默丢弃碰撞行，从不泄露其他租户记录。
 > - 分页细节：`next` cursor 在 DB 层（`st.List`）按 `limit+1` 行计算，MAC 过滤在 orch 层发生；若碰撞行被丢弃，实际返回条数可能少于 `limit`，但 cursor 仍指向正确位置，下页请求不受影响。
 
@@ -1389,13 +1468,30 @@ ownsSandbox(sb, apiKey):
 ```
 mode = authMode()
 if mode == "off" || route.AccessToken == "" → 放行
-if r.URL.Query()["signature"] != "" → 放行（envd 预签名文件 URL，envd 自行校验）
+if r.URL.Query().Get("signature") != "" → 放行（envd 预签名文件 URL，envd 自行校验签名；空值不豁免）
 if X-Access-Token == route.AccessToken（常数时间比较）→ 放行
 if mode == "log" → 放行 + 记 Warn 日志（token 不符但继续）
-否则（enforce 模式）→ 401
+否则（enforce 模式）→ 401 "invalid access token"
 ```
 
-数据面令牌（`envdAccessToken` / `trafficAccessToken`）由 orchestrator 在创建沙箱时生成并写入路由表，通过 `sandboxResp` 返回给 SDK，**与控制面 API key 相互独立**。
+> **配置约束**：`mmds.enabled=false`（envd 以 `-isnotfc` 非安全模式运行）时，config 验证强制要求 `proxy.auth=enforce`——proxy 是数据面唯一鉴权网关；`off`/`log` 模式仅在 `mmds.enabled=true`（envd 自身也验 token）时有效。
+
+**数据面令牌生成**：
+
+创建沙箱时 orchestrator 调用 `keys.MintToken()` 独立生成两个令牌（`crypto/rand` 32字节 → 64-hex 字符串）：
+
+| 令牌 | 生成方式 | 用途 |
+|------|---------|------|
+| `envdAccessToken` | `keys.MintToken()` | `sandboxResp` 返回 SDK（SDK 以此设 `X-Access-Token`）；写入 `routeEntry.AccessToken`，proxy 对每个数据面请求做常数时间比较；MMDS 启用时通过 `envdInit` 推给 envd（`POST /init payload["accessToken"]`），**create 和 resume 均调用**（resume 重新 key-in 从快照恢复的 envd；fork 场景下新令牌经 MMDS hash 校验替换父 envd 旧令牌），envd 在 guest 侧双重校验（defense-in-depth） |
+| `trafficAccessToken` | `keys.MintToken()` | 当前仅写入 sandbox 行并通过 `sandboxResp` 返回 SDK，**proxy/routesync 不消费**；e2b 协议兼容占位，随 migration token 保留 |
+
+两个令牌均存入 SQLite sandbox 行，随 migration token 携带跨节点保留，**与控制面 API key 相互独立**（无派生关系）。
+
+> **`MmdsSecret`（非数据面 HTTP 鉴权，Firecracker MMDS v2 专用）**：由 `HMAC-SHA256(manifestKey, "kuasar-mmds-v1:"+sandboxID)` 确定性派生（32字节）。
+> - `proxy_mode=internal`：MMDS server 由 orchestrator 内嵌，`Orchestrator.MmdsSecret()` 直接从 `sb.ManifestKey + sid` 派生，不依赖 routeEntry。
+> - `proxy_mode=external`：外部 proxy worker 缺少 manifest key，orchestrator 在 `routeEntry.MmdsSecret`（hex 编码）中携带预派生结果，proxy 的 `routetable.Table.MmdsSecret()` hex 解码后使用。
+> - **Session token 格式**：`"<sid>.<hex(HMAC-SHA256(MmdsSecret, sid))>"`，MMDS server 在 `PUT /latest/api/token` 时返回。
+> - **最终目的**：envd（FC 模式）用 session token 请求 `GET /`，MMDS server 验证后返回 `{accessTokenHash: hex(sha512(envdAccessToken))}`；envd 凭此 hash 在 guest 侧校验 SDK 传入的 `X-Access-Token`（defense-in-depth）。MMDS 禁用（envd 以 `-isnotfc` 启动）时整条路径不走。
 
 ### 4.11 数据库设计
 
