@@ -1,12 +1,12 @@
-# FE-2.2 node-ctl serve 沙箱生命周期管理
+# FE-2.2 node-ctl conductor 沙箱生命周期管理
 
 ---
 
 ## 1. 需求概述
 
-`node-ctl serve` 是运行在每个计算节点上的核心 daemon，对外暴露 e2b 兼容的 REST 控制面 API，负责将沙箱从创建、暂停、恢复到销毁的完整生命周期管理落地。它驱动 `sandbox-ctl`、`vswitch-ctl` 等底层组件，将沙箱状态持久化到节点本地 SQLite，并通过 routesync 协议实时通知数据面 proxy 更新路由表。
+`node-ctl conductor` 是运行在每个计算节点上的核心 daemon，对外暴露 e2b 兼容的 REST 控制面 API，负责将沙箱从创建、暂停、恢复到销毁的完整生命周期管理落地。它驱动 `sandbox-ctl`、`connector-ctl vswitch` 等底层组件，将沙箱状态持久化到节点本地 SQLite，并通过 routesync 协议实时通知数据面 proxy 更新路由表。
 
-**当前版本策略**：覆盖单节点全生命周期（create / pause / resume / kill / TTL reaper / reconcile / export / import）；集群 node-link 作为扩展功能在同一 serve 进程内可选启用。模板构建 pipeline 不在本文档范围内。
+**当前版本策略**：覆盖单节点全生命周期（create / pause / resume / kill / TTL reaper / reconcile / export / import）；集群 node-link 作为扩展功能在同一 conductor 进程内可选启用。模板构建 pipeline 不在本文档范围内。
 
 ---
 
@@ -19,7 +19,7 @@
 | # | 目标 | 验收方法 |
 |---|------|---------|
 | G-1 | 兼容 e2b SDK 发出的 REST 请求（create/get/list/kill/pause/connect/timeout）| e2b Python SDK 不改动直接对接 |
-| G-2 | 沙箱生命周期状态（running/paused/dead）持久化，serve 重启后可恢复 | kill -9 serve 后重启，running 沙箱被正确 adopt 或 teardown |
+| G-2 | 沙箱生命周期状态（running/paused/dead）持久化，conductor 重启后可恢复 | kill -9 conductor 后重启，running 沙箱被正确 adopt 或 teardown |
 | G-3 | paused 沙箱可通过 /connect 或数据面流量透明唤醒 | SDK `sandbox.resume()` 及 park/wake 路径均可触发恢复 |
 | G-4 | TTL 超时自动挂起（pause），不中断数据面已建连接 | timeout=300s 的沙箱 300s 后自动进入 paused |
 | G-5 | 沙箱跨节点迁移（export/import）：将暂停沙箱打包为 base64 token，在另一节点导入恢复 | `node-ctl export-sandbox` / `node-ctl import-sandbox` 可正常执行 |
@@ -28,7 +28,7 @@
 
 **Non-Goals**
 
-- 不实现 serve 进程的水平扩展（单节点 daemon）
+- 不实现 conductor 进程的水平扩展（单节点 daemon）
 - 不实现集群级调度（cluster-ctl registry 的职责）
 - 不实现容器化沙箱（仅支持 Firecracker microVM）
 - 不实现数据面 proxy 本身（proxy 由 `node-ctl proxy` 子命令承担）
@@ -40,7 +40,7 @@
 | D-1 | 沙箱 CRUD API（create / get / list / kill / timeout）|
 | D-2 | pause / connect（resume）控制面 API |
 | D-3 | 沙箱状态机：running → paused → dead，含 Reaper TTL 自动挂起 |
-| D-4 | 启动恢复（Reconcile）：serve 重启后 adopt 或 teardown 存量沙箱 |
+| D-4 | 启动恢复（Reconcile）：conductor 重启后 adopt 或 teardown 存量沙箱 |
 | D-5 | 本地 SQLite 持久化 + manifest key AES-256-GCM 加密 |
 | D-6 | config-socket 三平面（task / admin / api）|
 | D-7 | routesync publishUpsert/Delete 通知数据面 |
@@ -52,7 +52,7 @@
 | 维度 | E2B Cloud | fly.io Machines | 本方案 |
 |------|-----------|-----------------|--------|
 | Hypervisor | Firecracker microVM（per-sandbox Go goroutine，FC API over UDS）| Firecracker microVM | cloud-hypervisor（VMM API over UDS）|
-| 节点进程模型 | per-node orchestrator binary；Nomad 集群调度；PostgreSQL 主存储 + Redis 事件/缓存；网络槽 Consul KV | flyd 守护进程，REST API + FC | node-ctl serve（单节点 daemon），systemd sandbox-runner@ 单元；SQLite 单节点状态存储 |
+| 节点进程模型 | per-node orchestrator binary；Nomad 集群调度；PostgreSQL 主存储 + Redis 事件/缓存；网络槽 Consul KV | flyd 守护进程，REST API + FC | node-ctl conductor（单节点 daemon），systemd sandbox-runner@ 单元；SQLite 单节点状态存储 |
 | 生命周期管理 | 状态：running / paused；TTL per-sandbox goroutine（endAt）；auto-pause + auto-resume（流量触发）| REST API + Firecracker，节点有本地状态 | 兼容 e2b API 协议；状态机 + TTL Reaper + Reconcile |
 | 挂起/恢复 | FC snapshot：UFFD memfile diff（全量内存）或 filesystem-only 两种模式；rootfs via NBD overlay + dedup → GCS | `fly machine stop/start` | CH 原生 VM snapshot（CPU + 内存 + 设备状态）+ vhost-blk 块快照；`/connect` 触发透明恢复；快照数据（内存 + 磁盘）经 FastCDC 变长分块 + 收敛加密写入 manifest store，相同内容块跨沙箱/跨模板共享（content-addressed dedup），全零块不存储 |
 | 块设备/存储 | NBD（Network Block Device）+ 本地 block dedup（pause 时逐页比对 upper vs base，相同页不写入 diff，仅上传真正变化块）+ peer-to-peer chunk 传输（Redis registry）+ GCS 持久化 | 未公开 | vhost-blk（virtio-blk over vhost）+ 3 级缓存（L1 RocksDB / L2 EC 节点池 / L3 OBS）|
@@ -65,8 +65,8 @@
 ### 2.4 需求约束
 
 - **依赖 sandbox-ctl**：沙箱启动/快照/info 均通过 `exec sandbox-ctl` 完成，sandbox-ctl 必须与 node-ctl 并存于同一目录或 PATH
-- **依赖 vswitch-ctl**：网络 Attach/Detach 通过 `exec vswitch-ctl` 完成，需提前配置 vswitch（`sw0`）
-- **依赖 systemd**：沙箱以 `sandbox-runner@<sid>.service` 运行，serve 必须有 systemd D-Bus 权限
+- **依赖 connector-ctl vswitch**：网络 Attach/Detach 通过 `exec connector-ctl vswitch` 完成，需提前配置 vswitch（`sw0`）
+- **依赖 systemd**：沙箱以 `sandbox-runner@<sid>.service` 运行，conductor 必须有 systemd D-Bus 权限
 - **checkpoint.mode=remote 时**：export/import 需要远端 manifest store（S3/OBS），local 模式仅支持节点内恢复
 - **最大并发沙箱数**：受 vswitch BPF `MAX_PORTS=4096` 硬上限约束
 
@@ -124,7 +124,7 @@
 
 ### 3.2 架构影响分析
 
-serve 是节点数据面和控制面的枢纽，架构影响涵盖以下元素（详细交互见 §4.2 / §4.4 时序图）：
+conductor 是节点数据面和控制面的枢纽，架构影响涵盖以下元素（详细交互见 §4.2 / §4.4 时序图）：
 
 **新增组件**：无（利用现有 sandbox-runtime、sandbox-vswitch、sandbox-accelerator）
 
@@ -186,9 +186,9 @@ serve 是节点数据面和控制面的枢纽，架构影响涵盖以下元素�
 
 | 存量特性 | 配套方式 | 约束 |
 |---------|---------|------|
-| node-ctl proxy（external 模式）| serve publishUpsert 通过 routesync 推送路由 | proxy worker 必须已注册 config-socket plugin 平面 |
+| node-ctl proxy（external 模式）| conductor publishUpsert 通过 routesync 推送路由 | proxy worker 必须已注册 config-socket plugin 平面 |
 | MMDS v2（mmds.enabled）| envd 使用 MMDS 重新颁发 access token | 要求 proxy.mode ≠ off；vswitch 的 mgmt-service VIP 必须指向 MMDS listen |
-| sandbox-resource 动态资源控制 | resource_listen.enabled=true 时 serve 内嵌资源控制器 | 沙箱 sandbox.yaml 须配置 control_socket |
+| sandbox-resource 动态资源控制 | resource_listen.enabled=true 时 conductor 内嵌资源控制器 | 沙箱 sandbox.yaml 须配置 control_socket |
 | cluster node-link | cluster.registry ≠ "" 时自动连接 registry，路由双向同步 | 需要 node_id、labels、data_endpoint 配置；mTLS 可选 |
 
 #### exec 规格
@@ -253,7 +253,7 @@ POST /sandboxes/{id}/exec
 | 风险 | 缓解措施 |
 |------|---------|
 | vswitch attach/detach 失败导致 slot 泄漏 | launch 失败时 teardown（包含 Detach）；Reconcile 时检测 running-but-no-unit 的行 → teardown |
-| serve 重启期间 paused 沙箱 wake 无人应答 | proxy park_timeout 期间 serve 重启（< 5s 目标）；超时 park 返回 404 |
+| conductor 重启期间 paused 沙箱 wake 无人应答 | proxy park_timeout 期间 conductor 重启（< 5s 目标）；超时 park 返回 404 |
 | SQLite WAL 下并发写 | RangeByState 期间不写（调用方收集后再 teardown/SetState）；busy_timeout=5000ms |
 | snapshot 失败（磁盘满 / 快照写入失败）| pause 返回错误，沙箱保持 running；上层（cluster）按策略重试或 kill |
 | manifest key 泄漏 | 静态加密 + WAL 文件权限 0600；key 不出现在日志、API 响应、env |
@@ -286,7 +286,7 @@ type Orchestrator struct {
     cfg *config.Config
     st  *store.Store       // SQLite 持久化
     lc  launcher.Launcher  // systemd D-Bus 封装
-    vs  vsClient           // vswitch-ctl 封装
+    vs  vsClient           // connector-ctl vswitch 封装
 
     mu  sync.Mutex
     reg map[string]*types.Sandbox // 内存热缓存（running 沙箱）
@@ -337,7 +337,7 @@ sequenceDiagram
     participant C as Client
     participant O as node-ctl
     participant DB as SQLite
-    participant VS as vswitch-ctl
+    participant VS as connector-ctl-vswitch
     participant SD as systemd
     participant RS as node-ctl run-sandbox
     participant SC as sandbox-ctl run
@@ -348,7 +348,7 @@ sequenceDiagram
 
     C->>O: POST /sandboxes
     O->>O: resolveAllowed / ParseTemplateID / MintToken×2
-    O->>VS: Attach(innerIP) fork+exec vswitch-ctl attach
+    O->>VS: Attach(innerIP) connector-ctl vswitch attach
     VS-->>O: Port{floatingIP,MAC} stdout JSON
     O->>DB: st.Put(state=running)
     O->>SD: lc.Start(sandbox-runner@sid)
@@ -356,7 +356,7 @@ sequenceDiagram
     RS->>O: fetch LaunchSpec (config-socket task plane)
     O-->>RS: {exec:sandbox-ctl, args, MANIFEST_KEY}
     RS->>SC: syscall.Exec → sandbox-ctl run（同 PID）
-    SC->>VS: TapFDExec fork vswitch-ctl open-port
+    SC->>VS: TapFDExec connector-ctl vswitch open-port
     VS-->>SC: tap fd（socketpair SCM_RIGHTS）
     SC->>SC: 启动 vhost-blk servers（blk0.sock ro erofs, blk1.sock rw cow）
     SC->>SC: 创建 memfd（VM RAM 匿名文件）<br>启动 uffd.sock / launch.sock / ctl.sock
@@ -438,7 +438,7 @@ sequenceDiagram
     participant MS as manifest store
     participant DB as SQLite
     participant SD as systemd
-    participant VS as vswitch-ctl
+    participant VS as connector-ctl-vswitch
     participant P as proxy
 
     C->>O: POST /sandboxes/{id}/pause
@@ -479,7 +479,7 @@ sequenceDiagram
     O->>DB: SetSnapshotRef + SetState(paused)
     O->>SD: lc.Stop(sandbox-runner@sid)
     O->>SD: lc.ResetFailed(sandbox-runner@sid)
-    O->>VS: Detach(port) fork+exec vswitch-ctl detach
+    O->>VS: Detach(port) connector-ctl vswitch detach
     O->>P: publishUpsert(paused)
     O-->>C: 204
 ```
@@ -513,7 +513,7 @@ sequenceDiagram
     participant C as Client
     participant O as node-ctl
     participant DB as SQLite
-    participant VS as vswitch-ctl
+    participant VS as connector-ctl-vswitch
     participant SD as systemd
     participant RS as node-ctl run-sandbox
     participant SC as sandbox-ctl run
@@ -526,14 +526,14 @@ sequenceDiagram
     O->>DB: st.Get(id)
     alt state=paused
         O->>O: sf.Do(resumeIfPaused)
-        O->>VS: Attach(innerIP) fork+exec vswitch-ctl attach
+        O->>VS: Attach(innerIP) connector-ctl vswitch attach
         VS-->>O: Port{floatingIP,MAC} stdout JSON
         O->>SD: lc.Start(sandbox-runner@sid)
         SD->>RS: ExecStart=node-ctl run-sandbox
         RS->>O: fetch LaunchSpec (config-socket task plane)
         O-->>RS: {exec:sandbox-ctl, --restore ref, MANIFEST_KEY}
         RS->>SC: syscall.Exec → sandbox-ctl run（同 PID）
-        SC->>VS: TapFDExec fork vswitch-ctl open-port
+        SC->>VS: TapFDExec connector-ctl vswitch open-port
         VS-->>SC: tap fd（socketpair SCM_RIGHTS）
         SC->>SC: 打开快照 bundle（file:// 或 manifest://）<br>解析 ZIP → config.json / state.json / snapshot.cfg
         SC->>SC: 构建分层内存源（selfStream ++ from_refs）<br>→ uffd.StreamSnapshotSource
@@ -669,7 +669,7 @@ sequenceDiagram
     participant MS as manifest store
     participant REG as registry
     participant SD as systemd
-    participant VS as vswitch-ctl
+    participant VS as connector-ctl-vswitch
     participant RS as node-ctl run-sandbox
     participant CH as cloud-hypervisor
     participant SI as sandbox-init(guest)
@@ -717,7 +717,7 @@ sequenceDiagram
             R->>DB: SetSnapshotRef + SetState(paused)
             R->>SD: lc.Stop(sandbox-runner@sid)
             R->>SD: lc.ResetFailed(sandbox-runner@sid)
-            R->>VS: Detach(port) fork+exec vswitch-ctl detach
+            R->>VS: Detach(port) connector-ctl vswitch detach
             R->>P: publishUpsert(paused) ← proxy 开始 park 该沙箱流量
         end
         opt cluster.registry ≠ "" && deep_idle_sec > 0
@@ -744,14 +744,14 @@ sequenceDiagram
     Note over P,O: 流量到达时（异步，与 5s 循环无关）
     P->>O: Wake(sid)（routesync plugin plane 反向通知）
     O->>O: sf.Do(sid, resumeIfPaused)
-    O->>VS: Attach(innerIP) fork+exec vswitch-ctl attach
+    O->>VS: Attach(innerIP) connector-ctl vswitch attach
     VS-->>O: Port{floatingIP,MAC} stdout JSON
     O->>SD: lc.Start(sandbox-runner@sid)
     SD->>RS: ExecStart=node-ctl run-sandbox
     RS->>O: fetch LaunchSpec (config-socket task plane)
     O-->>RS: {exec:sandbox-ctl, --restore ref, MANIFEST_KEY}
     RS->>SC: syscall.Exec → sandbox-ctl run（同 PID）
-    SC->>VS: TapFDExec fork vswitch-ctl open-port
+    SC->>VS: TapFDExec connector-ctl vswitch open-port
     VS-->>SC: tap fd（socketpair SCM_RIGHTS）
     SC->>SC: 打开快照 bundle（file:// 或 manifest://）<br>解析 ZIP → config.json / state.json / snapshot.cfg
     SC->>SC: 构建分层内存源（selfStream ++ from_refs）→ uffd.StreamSnapshotSource
@@ -772,7 +772,7 @@ sequenceDiagram
 
 ### 4.7 Reconcile（启动恢复）
 
-serve 启动时运行 `Reconcile`，将 store 中 running 状态与 systemd 实际活跃 unit 对齐：
+conductor 启动时运行 `Reconcile`，将 store 中 running 状态与 systemd 实际活跃 unit 对齐：
 
 ```
 1. lc.List(runnerPattern) → alive{sid: true}（active|activating units）
@@ -790,18 +790,18 @@ serve 启动时运行 `Reconcile`，将 store 中 running 状态与 systemd 实�
 
 | 场景 | 处理 |
 |------|------|
-| serve 重启，沙箱正常 running | adopt（cache），无感知 |
-| serve 重启，沙箱 crash（unit inactive）| teardown → dead |
+| conductor 重启，沙箱正常 running | adopt（cache），无感知 |
+| conductor 重启，沙箱 crash（unit inactive）| teardown → dead |
 | 节点重启，所有 unit 消失 | 所有 running 行 → teardown → dead |
-| 新 serve 接管旧 serve 遗留的 unit | adopt 后 Reaper 按 deadline 正常处理 |
+| 新 conductor 接管旧 conductor 遗留的 unit | adopt 后 Reaper 按 deadline 正常处理 |
 
 ```mermaid
 sequenceDiagram
-    participant S as serve 启动
+    participant S as conductor 启动
     participant O as orch
     participant SD as systemd
     participant DB as SQLite
-    participant VS as vswitch-ctl
+    participant VS as connector-ctl-vswitch
     participant P as proxy
 
     S->>O: Reconcile()
@@ -821,7 +821,7 @@ sequenceDiagram
     loop 每个 dead sb → teardown(sb)
         O->>SD: lc.Stop(sandbox-runner@sid)（KillMode=control-group，SIGKILL cgroup，CH 一并退出）
         O->>SD: lc.ResetFailed(sandbox-runner@sid)
-        O->>VS: vs.Detach(sb.VswitchPort) fork+exec vswitch-ctl detach
+        O->>VS: vs.Detach(sb.VswitchPort) connector-ctl vswitch detach
         O->>O: os.RemoveAll(sb.RunDir)（清理 tmpfs run dir）
         O->>O: uncache(sb.ID)
         O->>DB: st.SetState(dead)
@@ -840,7 +840,7 @@ sequenceDiagram
     participant REG as registry
     participant O2 as node-ctl(目标节点)
     participant DB2 as SQLite(目标节点)
-    participant VS2 as vswitch-ctl(目标节点)
+    participant VS2 as connector-ctl-vswitch(目标节点)
     participant SD2 as systemd(目标节点)
     participant RS2 as run-sandbox(目标节点)
     participant SC2 as sandbox-ctl(目标节点)
@@ -859,7 +859,7 @@ sequenceDiagram
     O2->>O2: HandleCommand → precheckCluster<br>resolveByFingerprint → manifestKey
     O2->>O2: bootCluster → migrateCluster
     O2->>O2: importSandboxWithKey(manifestKey, tok)<br>base64.Decode token → fingerprint/digest 校验 → st.Put(state=paused)
-    O2->>VS2: Attach(innerIP) fork+exec vswitch-ctl attach
+    O2->>VS2: Attach(innerIP) connector-ctl vswitch attach
     VS2-->>O2: Port{floatingIP,MAC}
     O2->>SD2: lc.Start(sandbox-runner@sid)
     SD2->>RS2: ExecStart=node-ctl run-sandbox
@@ -1237,7 +1237,7 @@ sequenceDiagram
 
 #### 4.10.2 内部 API（config-socket 三平面）
 
-路径：`/run/sandbox/node-ctl.socket`（UDS），serve 启动时绑定。
+路径：`/run/sandbox/node-ctl.socket`（UDS），conductor 启动时绑定。
 
 | 平面 | 触发方 | 功能 |
 |------|-------|------|
@@ -1468,8 +1468,9 @@ ownsSandbox(sb, apiKey):
 ```
 mode = authMode()
 if mode == "off" || route.AccessToken == "" → 放行
-if r.URL.Query().Get("signature") != "" → 放行（envd 预签名文件 URL，envd 自行校验签名；空值不豁免）
-if X-Access-Token == route.AccessToken（常数时间比较）→ 放行
+res = envdsign.CheckDataPlaneAuth(r, port, route.AccessToken, now())
+    // 内部统一处理 X-Access-Token header 校验及预签名 URL 等场景
+if res.OK → 放行
 if mode == "log" → 放行 + 记 Warn 日志（token 不符但继续）
 否则（enforce 模式）→ 401 "invalid access token"
 ```
@@ -1482,7 +1483,7 @@ if mode == "log" → 放行 + 记 Warn 日志（token 不符但继续）
 
 | 令牌 | 生成方式 | 用途 |
 |------|---------|------|
-| `envdAccessToken` | `keys.MintToken()` | `sandboxResp` 返回 SDK（SDK 以此设 `X-Access-Token`）；写入 `routeEntry.AccessToken`，proxy 对每个数据面请求做常数时间比较；MMDS 启用时通过 `envdInit` 推给 envd（`POST /init payload["accessToken"]`），**create 和 resume 均调用**（resume 重新 key-in 从快照恢复的 envd；fork 场景下新令牌经 MMDS hash 校验替换父 envd 旧令牌），envd 在 guest 侧双重校验（defense-in-depth） |
+| `envdAccessToken` | `keys.MintToken()` | `sandboxResp` 返回 SDK（SDK 以此设 `X-Access-Token`）；写入 `routeEntry.AccessToken`，proxy 对每个数据面请求通过 `envdsign.CheckDataPlaneAuth` 校验；MMDS 启用时通过 `envdInit` 推给 envd（`POST /init payload["accessToken"]`），**create 和 resume 均调用**（resume 重新 key-in 从快照恢复的 envd；fork 场景下新令牌经 MMDS hash 校验替换父 envd 旧令牌），envd 在 guest 侧双重校验（defense-in-depth） |
 | `trafficAccessToken` | `keys.MintToken()` | 当前仅写入 sandbox 行并通过 `sandboxResp` 返回 SDK，**proxy/routesync 不消费**；e2b 协议兼容占位，随 migration token 保留 |
 
 两个令牌均存入 SQLite sandbox 行，随 migration token 携带跨节点保留，**与控制面 API key 相互独立**（无派生关系）。
@@ -1544,7 +1545,7 @@ if mode == "log" → 放行 + 记 Warn 日志（token 不符但继续）
 
 #### 缓存结构
 
-- `Orchestrator.reg`（`map[string]*types.Sandbox`，sync.Mutex 保护）：running 沙箱的内存热缓存，Route / MMDS 查表 O(1)，serve 重启后由 Reconcile 重建
+- `Orchestrator.reg`（`map[string]*types.Sandbox`，sync.Mutex 保护）：running 沙箱的内存热缓存，Route / MMDS 查表 O(1)，conductor 重启后由 Reconcile 重建
 
 #### 升级方案
 
@@ -1661,8 +1662,8 @@ manifest_config: /opt/sandbox/manifest.yaml  # remote manifest store 配置
 | `exec sandbox-ctl snapshot [--upload\|--output]` | pause | 本地或远端快照 |
 | `exec sandbox-ctl info --json` | restore 前读快照 capacity + network | best-effort，失败用节点默认值 |
 | `exec sandbox-ctl upload-snapshot` | export-sandbox promote | 本地 bundle → manifest store |
-| `exec vswitch-ctl attach` | create / resume | 分配 slot + floatingIP |
-| `exec vswitch-ctl detach` | pause / kill | 释放 slot |
+| `exec connector-ctl vswitch attach` | create / resume | 分配 slot + floatingIP |
+| `exec connector-ctl vswitch detach` | pause / kill | 释放 slot |
 | systemd D-Bus StartUnit / StopUnit | create / pause / kill | 管理 sandbox-runner@<sid>.service |
 | `exec sandbox-ctl exec` | exec | 由 sandbox-ctl 连接 envd UDS；流式输出 stdout/stderr；仅 e2b profile |
 
@@ -1670,7 +1671,7 @@ manifest_config: /opt/sandbox/manifest.yaml  # remote manifest store 配置
 
 ### 4.15 沙箱进程视图、cgroup 与资源控制
 
-本节描述 serve 的进程拓扑和 cgroup 结构，以及 `resource_listen.enabled=true` 时生效的动态资源控制协议。
+本节描述 conductor 的进程拓扑和 cgroup 结构，以及 `resource_listen.enabled=true` 时生效的动态资源控制协议。
 
 #### 进程拓扑
 
@@ -1678,7 +1679,7 @@ manifest_config: /opt/sandbox/manifest.yaml  # remote manifest store 配置
 systemd (PID 1)
 │
 ├── node-ctl.service
-│     └── node-ctl serve (PID X)                    ← 节点控制面 daemon
+│     └── node-ctl conductor (PID X)                ← 节点控制面 daemon
 │           [goroutines]:
 │           ├── API HTTP server
 │           ├── config-socket (task/admin/plugin 平面)
@@ -1697,7 +1698,7 @@ systemd (PID 1)
 │                 ├── vhost-blk 服务端 × (1+N 磁盘)   ← CH --disk UDS 后端
 │                 ├── uffd va_report 服务器            ← 接收 CH uffd fd
 │                 ├── uffd Handler                     ← 处理缺页（cold=zero/restore=读快照）
-│                 ├── launch server (vsock port 9000)  ← 握手 / 升为 stdio MUX
+│                 ├── launch server (vsock port 5000)  ← 握手 / 升为 stdio MUX
 │                 ├── Pinger (1 s)                     ← 宿主→guest 心跳探测
 │                 ├── ctl.sock server                  ← snapshot / info 请求
 │                 ├── BalloonController (5 s reconcile)← PUT /api/v1/vm.resize
@@ -1723,12 +1724,12 @@ systemd (PID 1)
 | 静态 cgroup（static）| ✓ | ✗ | `memory.max` / `cpu.weight` 固定在启动时写入；`memory.high` 在 Settled 后写入 |
 | 动态控制（dynamic）| ✓ | ✓ | 控制器管理 `allocatable_now`；Heartbeat 同步；PSI 传感器主动请求 budget |
 
-**adopt 模式（`--cgroup-adopt`，serve 当前实现）**
+**adopt 模式（`--cgroup-adopt`，conductor 当前实现）**
 
 ```
 /sys/fs/cgroup/
 │
-├── system.slice/node-ctl.service/          ← node-ctl serve 在此 cgroup
+├── system.slice/node-ctl.service/          ← node-ctl conductor 在此 cgroup
 │
 └── sandbox-runner.slice/
     └── sandbox-runner@<sid>.service/       ← 单元 cgroup 即 sandbox 资源 cgroup（Delegate=yes）
@@ -1740,11 +1741,11 @@ systemd (PID 1)
           │  cpu.weight   = clamp(allocatable.cpu × 100, 1, 10000)
 ```
 
-serve 的 LaunchSpec 始终传 `--cgroup-adopt`：sandbox-ctl 通过 `SelfCgroupV2Path()` 将自身所在的单元 cgroup 作为 sandbox 资源 cgroup，`AddPID` 是 no-op（CH 作为 fork 子进程已自然成员）。选择此模式的原因是简化 stop 语义——sandbox-ctl 与 CH 共处同一单元 cgroup，`KillMode=control-group` 一次覆盖两者，无需依赖 sandbox-ctl 主动 Kill CH 后再退出。
+conductor 的 LaunchSpec 始终传 `--cgroup-adopt`：sandbox-ctl 通过 `SelfCgroupV2Path()` 将自身所在的单元 cgroup 作为 sandbox 资源 cgroup，`AddPID` 是 no-op（CH 作为 fork 子进程已自然成员）。选择此模式的原因是简化 stop 语义——sandbox-ctl 与 CH 共处同一单元 cgroup，`KillMode=control-group` 一次覆盖两者，无需依赖 sandbox-ctl 主动 Kill CH 后再退出。
 
 **已知 trade-off**：`cgroup.go` 中 `CgroupConfig.Adopt` 字段的注释明确标注此模式 **"re-exposes"** 了非 adopt 设计所修复的死锁——若 sandbox-ctl goroutine 在 `memory.high` 超限期间发起系统调用，内核 `mem_cgroup_handle_over_high` 会将该线程置于 `TASK_KILLABLE D-state`，Go 调度器无法继续运行，导致 sandbox-ctl 既无法 SIGKILL CH 也无法 `cmd.Wait()`（此路径在密度压测中以等价场景实测复现）。Balloon 与 PSI 传感器降低了 `memory.high` 被持续突破的概率，但不从根本上消除该风险。
 
-**非 adopt 模式（架构上更安全，需显式 `--cgroup-path`，serve 不使用）**
+**非 adopt 模式（架构上更安全，需显式 `--cgroup-path`，conductor 不使用）**
 
 ```
 /sys/fs/cgroup/
@@ -1758,7 +1759,7 @@ serve 的 LaunchSpec 始终传 `--cgroup-adopt`：sandbox-ctl 通过 `SelfCgroup
                 │  memory.max / memory.high / cpu.max / cpu.weight
 ```
 
-sandbox-ctl 不在 sandbox cgroup 内，彻底规避上述死锁风险，是 `cgroup.go` 文件头注释所描述的设计意图（"sandbox-ctl NEVER joins the sandbox cgroup itself"）。代价是需要调用方显式提供 `--cgroup-path` 并预先创建 cgroup 目录；serve 路径不使用此模式。
+sandbox-ctl 不在 sandbox cgroup 内，彻底规避上述死锁风险，是 `cgroup.go` 文件头注释所描述的设计意图（"sandbox-ctl NEVER joins the sandbox cgroup itself"）。代价是需要调用方显式提供 `--cgroup-path` 并预先创建 cgroup 目录；conductor 路径不使用此模式。
 
 **友商参考（E2B infra）**
 
@@ -1802,14 +1803,14 @@ orch.Kill / orch.Pause → lc.Stop("sandbox-runner@<sid>.service")
                   ▼ systemd TimeoutStopSec=20s 兜底
 ```
 
-**KillMode=control-group** 作用于单元 cgroup。adopt 模式（serve 默认）中 sandbox-ctl 与 cloud-hypervisor 共处同一单元 cgroup，systemd 的 SIGTERM 和最终 SIGKILL 均直接命中两者；sandbox-ctl 的信号处理优先尝试 `PUT /api/v1/vmm.shutdown` 有序关机，超时后发 SIGKILL，作为 KillMode SIGKILL 的前置保证。
+**KillMode=control-group** 作用于单元 cgroup。adopt 模式（conductor 默认）中 sandbox-ctl 与 cloud-hypervisor 共处同一单元 cgroup，systemd 的 SIGTERM 和最终 SIGKILL 均直接命中两者；sandbox-ctl 的信号处理优先尝试 `PUT /api/v1/vmm.shutdown` 有序关机，超时后发 SIGKILL，作为 KillMode SIGKILL 的前置保证。
 
 #### 文件系统与 UDS 布局
 
 ```
 /run/sandbox/<sid>/          ← tmpfs 运行目录（sandbox-ctl 创建，退出时 RemoveAll）
   ├── ch.sock                ← CH HTTP API（BalloonController / ctl.sock snapshot）
-  ├── vsock.sock_9000        ← launch server / stdio MUX（vsock port 9000）
+  ├── vsock.sock_5000        ← launch server / stdio MUX（vsock port 5000）
   ├── uffd.sock              ← va_report server（CH → sandbox-ctl 传递 uffd fd）
   ├── ctl.sock               ← snapshot / info 请求（node-ctl → sandbox-ctl）
   ├── envd.sock              ← envd UDS（sandbox-ctl exec 连接目标，e2b profile）
@@ -1826,7 +1827,7 @@ orch.Kill / orch.Pause → lc.Stop("sandbox-runner@<sid>.service")
 
 #### 节点内存池模型（resource_listen 模式）
 
-控制器在 `serve` 启动时从 `/proc/meminfo` 自动探测物理内存，减去 `host_reserved` 和 `operational_margin` 后得到 `allocatable_pool`：
+控制器在 `conductor` 启动时从 `/proc/meminfo` 自动探测物理内存，减去 `host_reserved` 和 `operational_margin` 后得到 `allocatable_pool`：
 
 ```
 allocatable_pool = (physical_mem − host_reserved) × (1 − operational_margin_factor)
@@ -1855,7 +1856,7 @@ startup_pool     = allocatable_pool × startup_factor
 | `resources.startup.memory` | 冷启动阶段初始 budget | Admit 授予 `max(startup, allocatable, allocatable_at_snapshot)` |
 | `resources.overhead.memory` | CH 进程自身内存开销 | `memory.max = capacity + overhead`（防止 CH OOM）|
 | `resources.watermark_high.memory` | PSI 阈值 | `memory.high`（默认 `allocatable × 0.875`）|
-| `resources.control.cgroup_path` | cgroup 目录 | sandbox-ctl 写入 limits；adopt 模式（serve 默认）CH 继承单元 cgroup，AddPID 是 no-op；非 adopt 模式 CH 经 AddPID 写入独立子 cgroup |
+| `resources.control.cgroup_path` | cgroup 目录 | sandbox-ctl 写入 limits；adopt 模式（conductor 默认）CH 继承单元 cgroup，AddPID 是 no-op；非 adopt 模式 CH 经 AddPID 写入独立子 cgroup |
 | `resources.control.controller` | 控制器 UDS | 动态模式入口 |
 | `resources.control.sensor` | PSI 传感器参数 | 默认 "some 10ms stall / 1s window" |
 
@@ -1955,7 +1956,7 @@ guest sandbox-init ──── mem_report (vsock) ────► BalloonContro
 | resume（/connect）| launch(snp) + waitReady | < 5 s（local 快照）；< 30 s（remote 快照）|
 | kill | Stop unit + Detach + RemoveAll | < 1 s |
 | Reconcile（启动）| 4096 行 RangeByState + 逐个 cache | < 1 s（SQLite WAL 顺序读）|
-| 路由查表（Route）| sync.Map Lookup | ~51 ns（P50 实测，Xeon E5-2680 v4）|
+| 路由查表（Route）| proxyshm.WorkerView.Lookup | ~51 ns（P50 实测，Xeon E5-2680 v4）|
 | publishUpsert（routesync）| publish → 1024 buffer channel | 非阻塞，< 1 µs（非满载时）|
 
 ### 容量
@@ -1975,9 +1976,9 @@ guest sandbox-init ──── mem_report (vsock) ────► BalloonContro
 
 | 故障 | 行为 | 恢复 |
 |------|------|------|
-| serve 崩溃/重启 | running 沙箱数据面由 eBPF flowtable 维持（已建连接）；新连接依赖 proxy 缓存路由（park_timeout 内有效）| serve 重启后 Reconcile adopt；proxy 自动重连 routesync |
-| sandbox-ctl crash | systemd unit inactive；Reconcile 检测 → teardown | 下次 Reconcile（下次 serve 启动）清理 |
-| vswitch-ctl detach 失败 | teardown 记录 warn 日志，继续执行 | slot 可能泄漏；需运维介入 `vswitch-ctl detach` |
+| conductor 崩溃/重启 | running 沙箱数据面由 eBPF flowtable 维持（已建连接）；新连接依赖 proxy 缓存路由（park_timeout 内有效）| conductor 重启后 Reconcile adopt；proxy 自动重连 routesync |
+| sandbox-ctl crash | systemd unit inactive；Reconcile 检测 → teardown | 下次 Reconcile（下次 conductor 启动）清理 |
+| connector-ctl vswitch detach 失败 | teardown 记录 warn 日志，继续执行 | slot 可能泄漏；需运维介入 `connector-ctl vswitch detach` |
 | SQLite busy（5s timeout）| store 操作返回错误 | 上层返回 500；操作可重试 |
 | snapshot 失败 | pause 返回错误，沙箱保持 running | 上层重试或 kill |
 | envd /init 失败 | launch 继续（Warn 日志）| 沙箱可用，但 env/token 可能未完全初始化 |
@@ -1997,7 +1998,7 @@ guest sandbox-init ──── mem_report (vsock) ────► BalloonContro
 ### 6.4 数据可靠性
 
 - **manifest_key 加密**：AES-256-GCM，key 在 SQLite 中以密文存储，key_hash 为非唯一指纹，解密后 HMAC 比对
-- **操作原子性**：pause 先写 store（snapshot_ref + state=paused），后 Stop unit + Detach；若 store 写成功但 Stop 失败，serve 重启后 Reconcile 会将 unit 仍 active 的沙箱 adopt（running），但 snapshot_ref 已写入，数据不丢失
+- **操作原子性**：pause 先写 store（snapshot_ref + state=paused），后 Stop unit + Detach；若 store 写成功但 Stop 失败，conductor 重启后 Reconcile 会将 unit 仍 active 的沙箱 adopt（running），但 snapshot_ref 已写入，数据不丢失
 - **local checkpoint 目录**：`/var/lib/sandbox-saved`（持久存储，非 tmpfs），survive 节点重启
 
 ### 6.5 SLI/SLO
@@ -2015,7 +2016,7 @@ guest sandbox-init ──── mem_report (vsock) ────► BalloonContro
 
 | 告警 | 触发条件 |
 |------|---------|
-| serve 进程消失 | systemd unit inactive（PID 消失）|
+| conductor 进程消失 | systemd unit inactive（PID 消失）|
 | Reaper pause 连续失败 | 5min 内 > 3 次 Warn "reaper pause" |
 | SQLite busy 频繁 | busy 日志 > 10/min |
 | 沙箱数接近上限 | running+paused > 3800（vswitch 4096 预警）|

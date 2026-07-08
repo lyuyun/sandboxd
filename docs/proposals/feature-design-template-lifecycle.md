@@ -1,4 +1,4 @@
-# FE-BUILD-01: node-ctl serve 支持沙箱快照生命周期管理
+# FE-BUILD-01: node-ctl conductor 支持沙箱快照生命周期管理
 
 ## 1. 需求概述
 
@@ -7,12 +7,13 @@ sandbox 启动依赖两种制品：**img**（镜像）和 **snp**（快照）。
 - **img**：OCI 镜像通过 flatten-ctl 扁平化后存入 manifest store，sandbox 从该 erofs 镜像冷启动。
 - **snp**：包含冻结内存状态的快照，sandbox 可直接 resume，跳过冷启动和进程初始化。
 
-制品通过两条路径产出：
+制品通过三条路径产出，均经由构建 pipeline（RegisterBuild → TriggerBuild → BuildPool 调度）：
 
-- **template 构建 pipeline**（e2b profile）：经 RegisterBuild → TriggerBuild → 三阶段构建（OCI 镜像拉取、步骤执行、快照采集），产出 img 或 snp 并上传 manifest store。
-- **pause + export**（bare / e2b profile）：任意运行中的 sandbox 完成初始化后，`pause` 冻结内存状态，`export` 将快照 promote 到 manifest store，产出 snp，无需 envd。
+- **OCI 基础镜像展平**（Phase A）：将 OCI 镜像在 builder sandbox 内通过 `flatten-ctl export` 扁平化为 EROFS，上传 manifest store，产出 `<profile>-img-<key>`。支持 e2b 和 bare profile（bare 待支持，见 §4.9.5）。
+- **自定义构建展平镜像**（Phase A + B）：在 Phase A 基础上，在 builder sandbox 内执行 RUN / COPY / ENV 等构建步骤后再次 flatten，产出含自定义内容的 `e2b-img-<key>`。仅支持 e2b profile（Phase B 依赖 envd）。
+- **内存快照**（Phase A/B + C）：在展平镜像基础上冷启动 production sandbox，通过 envd 执行 `startCmd` 并等待 `readyCmd` 就绪，采集内存快照上传，产出 `e2b-snp-<key>`。仅支持 e2b profile（Phase C 依赖 envd）。
 
-本特性在 `node-ctl serve`（主编排进程）中实现完整的 template 生命周期管理，涵盖注册（RegisterBuild）、触发构建（TriggerBuild）、三阶段构建调度（BuildPool），到发布（ready PersistID）、列举（ListTemplates）、TTL 老化（TemplateGC）的全链路。目标是在不引入额外服务进程的情况下，让单节点 `node-ctl serve` 具备 e2b 兼容的 template 全生命周期能力。
+本特性在 `node-ctl conductor`（主编排进程）中实现完整的 template 生命周期管理，涵盖注册（RegisterBuild）、触发构建（TriggerBuild）、三阶段构建调度（BuildPool），到发布（ready PersistID）、列举（ListTemplates）、TTL 老化（TemplateGC）的全链路。目标是在不引入额外服务进程的情况下，让单节点 `node-ctl conductor` 具备 e2b 兼容的 template 全生命周期能力。
 
 ---
 
@@ -30,7 +31,7 @@ sandbox 启动依赖两种制品：**img**（镜像）和 **snp**（快照）。
 | manifest key 等敏感信息通过 config-socket 传递，不落盘 | BuildSpec 中 `MANIFEST_KEY` 和 `FLATTEN_REGISTRY_*` 仅在 config-socket 会话内传输 |
 | 支持 fromImage（OCI 基础镜像）和 fromTemplate（基于已有快照继承）两种构建源 | 两种路径均可走通，fromTemplate 能正确继承 `start_cmd`/`ready_cmd` 和 overlay 链 |
 | 支持 RUN / ENV / ARG / WORKDIR / USER / COPY 六种构建步骤 | 每种步骤类型可正确执行，COPY 需 files_storage 配置 |
-| bare profile sandbox 可通过 pause + export 路径产出可复用快照模板 | 对 bare sandbox 执行 pause 后 export（`toTemplate=true`），返回的 persist id（`bare-snp-<key>`）可被后续 `POST /sandboxes` 直接引用，从快照 resume |
+| bare profile sandbox 可通过 API 全流程产出可复用基础镜像 | Phase A build 产出 `bare-img-<key>`（待支持，见 §4.9.5），可被后续 `POST /sandboxes` 直接引用冷启动 |
 
 **Non-Goals**
 
@@ -47,7 +48,8 @@ sandbox 启动依赖两种制品：**img**（镜像）和 **snp**（快照）。
 - `internal/configsock/server.go`：`PathTaskBuildSpec`、`BuildSpec`、`BuildStep`、`BuildPaths`、`BuildNet`、`BuildTimeouts` 数据结构
 - `internal/types/build.go`：`Build`、`BuildState`、`TemplateStep`、`BuildState.SDKStatus()` 状态映射
 - `internal/orch/migrate.go`：`ExportSandbox`（bare profile pause + export 路径，文档记录，无代码改动）
-- `sandbox-accelerator/cmd/flatten-ctl`：`export --upload`（bare img 基础镜像预置，带外运维操作，无代码改动）
+- `sandbox-accelerator/cmd/flatten-ctl`：`export --upload`（bare img 基础镜像预置，Phase A bare build 待支持前的临时替代，无代码改动）
+- `internal/orch/build.go`（待支持）：`newRegisteredBuild` / `runBuildUnit` / `BuildSpecFor` 三处 `ProfileE2B` 硬编码参数化，支持 bare profile Phase A img build（见 §4.9.5）
 
 ### 2.3 友商分析
 
@@ -126,32 +128,22 @@ sandbox 启动依赖两种制品：**img**（镜像）和 **snp**（快照）。
 - 正在被 sandbox 使用的快照内容（manifest store 层）不受 builds 表记录删除影响；sandbox 运行期间仍可访问快照
 - 若 template 记录被 GC 后，仍以该 persist id 发起 fromTemplate 构建，TriggerBuild 报 404
 
-#### Story 6：运维人员将 bare sandbox 运行时状态固化为快照模板
+#### Story 6：通过 API 全流程产出 bare profile 基础镜像
 
-> 作为一个平台运维人员，我想要将一个已初始化好的 bare sandbox 的运行时状态制作成快照模板，以便于后续从该快照极速启动同类 sandbox，跳过初始化过程。
+> 作为一个平台运维人员，我想要通过纯 API 调用，将一个 OCI 镜像展平为 bare 基础镜像，以便后续从该镜像冷启动 bare sandbox，且全程无需登录节点执行命令行。
 
-前提：节点已部署 manifest store 并配置好 manifest config（含租户加密密钥）。
+1. `POST /v3/templates {"profile":"bare"}` → 分配 bare templateID + buildID，Kind=img
+2. `POST /v2/templates/{tid}/builds/{bid} {"fromImage":"<oci-image-ref>"}` → 无 startCmd、无 steps → 触发 Phase A：builder 沙箱内执行 `flatten-ctl export` 展平 OCI 镜像，产出 `bare-img-<key>`
+3. `GET /templates/{tid}/builds/{bid}/status` 轮询至 `ready`，获取 `templateID: "bare-img-<key>"`
+4. `POST /sandboxes {"templateID":"bare-img-<key>"}` → 验证可从展平镜像冷启动 bare sandbox（无 envd）
 
-**阶段一：预置 bare img 基础镜像**（详见 §4.9.0）
+验收：执行步骤 1–4，步骤 4 的 sandbox 成功冷启动且无 envd；全程通过 API 完成，无需 SSH 到节点。
 
-0. 在宿主机执行 `flatten-ctl export <oci-image-ref> --upload --manifest-config <cfg>` → stdout 输出 `<64hex-key>` → 基础镜像 templateID 为 `bare-img-<key>`
-
-**阶段二：创建 bare sandbox 并固化快照**
-
-1. `POST /sandboxes {"templateID":"bare-img-<key>"}` → 从 img 冷启动 bare sandbox（无 envd）
-2. 运维人员在 sandbox 内完成所需的初始化操作（进程启动、文件写入等）
-3. `POST /sandboxes/{id}/pause` → 冻结内存状态，生成快照 → 返回 `204 No Content`
-4. `POST /sandboxes/{id}/export {"toTemplate":true}` → 若快照在本地则 promote 到 manifest store → 返回 `{"result": "bare-snp-<key>"}`；源 sandbox 行保留（仍为 PAUSED 状态）
-
-**阶段三：验证极速 resume**
-
-5. `POST /sandboxes {"templateID":"bare-snp-<key>"}` → 直接从快照 resume，验证跳过冷启动
-
-验收：执行步骤 0–5，步骤 5 创建的 sandbox 状态与步骤 2 初始化后一致，启动耗时显著低于同等冷启动；步骤 4 完成后源 sandbox（步骤 1 创建）仍可查询且状态为 paused。
+> **当前实现状态**：步骤 1–3（Phase A bare build）尚未实现，`newRegisteredBuild`、`runBuildUnit`、`BuildSpecFor` 三处硬编码 `ProfileE2B`；Phase A 本身不依赖 envd，技术可行，详见 §3.4 约束 6 与 §4.9.5。临时替代：用宿主机执行 `flatten-ctl export --upload` 代替步骤 1–3（参见 §4.9.0），步骤 4 不变。
 
 ### 3.2 架构影响分析
 
-- **无新服务进程**：template 生命周期管理完全在现有 `node-ctl serve` 框架内，通过 systemd 单元隔离 builder 子进程。
+- **无新服务进程**：template 生命周期管理完全在现有 `node-ctl conductor` 框架内，通过 systemd 单元隔离 builder 子进程。
 - **config-socket 扩展**：在原有 `LaunchSpec`（`PathTaskLaunchSpec`）通道旁增加 `BuildSpec`（`PathTaskBuildSpec`）通道，协议兼容，不影响已有 sandbox runner。
 - **vswitch 资源影响**：构建期间占用一个 vswitch port，与 sandbox 共享池，需在节点容量规划中考虑在建 template 数量（= `builder.max_concurrent`）。
 - **存储依赖**：新增 manifest store 写入路径（`manifest-ctl store` / `sandbox-ctl upload-snapshot`），生产部署需保证 manifest store 可达且有足够吞吐。
@@ -168,22 +160,23 @@ sandbox 启动依赖两种制品：**img**（镜像）和 **snp**（快照）。
 | 凭证优先级 | pullToken > regUser/regPass > clusterAuth > 租户默认（registry_auth_enc） |
 | PersistID 格式 | `<profile>-<kind>-<64hex-key>`，如 `e2b-snp-<key>` |
 | SDK 状态映射 | registered/waiting/building → "building"；ready → "ready"；error → "error" |
-| bare profile 快照模板创建 | pause + export 路径；不经过 build pipeline；不写 builds 表，persist id（`bare-snp-<key>`）自描述，可直接用于创建 sandbox |
+| bare profile 基础镜像创建 | build pipeline Phase A 产出 `bare-img-<key>`（待支持，见 §4.9.5），写 builds 表，可直接用于 `POST /sandboxes` 冷启动 |
 | template 老化回收 | TTL 到期后由后台 GC 删除 builds 表记录；不提供租户侧删除接口；manifest store 内容由独立 GC 清理 |
 
 ### 3.4 风险及设计约束
 
 1. **构建 sandbox 共用网络槽**：三阶段顺序复用同一 vswitch port，tapfd 通过 `TapFDExec` 重新拉取队列 fd。若中间阶段异常退出，下一阶段 sandbox 仍能获得同一个 port，但需确保上一个 sandbox 进程已完全终止。
 2. **result 文件时序**：`o.lc.Start(unit)` 在 Type=oneshot 单元退出后才返回，随后读取 `<bid>.result`；若单元因 OOM/SIGKILL 崩溃（非正常 exit），result 文件可能不存在，此时 startErr != nil 且 readErr != nil，编排器将其归类为基础设施错误。
-3. **MMDS synthetic route 泄漏**：若 `runBuildUnit` 的 defer 未执行（进程信号），synthetic route 行（build-<bid>）将残留在内存路由表，可被数据面误路由。需在 serve 启动时的 reaper 阶段清理孤儿 build route。
+3. **MMDS synthetic route 泄漏**：若 `runBuildUnit` 的 defer 未执行（进程信号），synthetic route 行（build-<bid>）将残留在内存路由表，可被数据面误路由。需在 conductor 启动时的 reaper 阶段清理孤儿 build route。
 4. **fromTemplate overlay 链长度**：多级 fromTemplate 继承会形成 `manifest://k1:k2:k3:...` 的多 key ref，每次 boot 都需按顺序拉取所有层；建议在 TriggerBuild 阶段对链长设置上限（建议 ≤ 8 层）。
 5. **敏感信息生命周期**：`BuildSpec.Env["MANIFEST_KEY"]` 仅在 config-socket 会话期间在内存中，`pend` map 在 `runBuildUnit` 返回前持有明文密钥，属于正常设计但需确保 `pend` 不被日志序列化输出。
+6. **Phase A bare profile 支持缺口**：`newRegisteredBuild` 硬编码 `Profile: types.ProfileE2B`，`runBuildUnit` 的 `allocInnerIP` 和 `BuildSpecFor` 的 `innerGateway` 也硬编码为 e2b，导致 bare profile 无法走 Phase A build 路径。Story 6 描述的 API 全流程依赖消除这三处硬编码，详见 §4.9.5。Phase A 本身仅使用 `sandbox-ctl exec` 驱动 `flatten-ctl export`，不依赖 envd，技术上可行。
 
 ### 3.5 可选的替代方案
 
 **方案 B：独立 builder 进程**（已排除）
 
-将 template 生命周期管理中的构建部分拆出为独立的 `node-ctl builder` 守护进程，通过 gRPC 与 `serve` 通信。优点是进程隔离更彻底；缺点是增加进程数、部署复杂度、vswitch slot 分配需跨进程协调。当前方案通过 systemd 单元 cgroup 隔离已满足安全边界，不值得增加部署复杂度。
+将 template 生命周期管理中的构建部分拆出为独立的 `node-ctl builder` 守护进程，通过 gRPC 与 `conductor` 通信。优点是进程隔离更彻底；缺点是增加进程数、部署复杂度、vswitch slot 分配需跨进程协调。当前方案通过 systemd 单元 cgroup 隔离已满足安全边界，不值得增加部署复杂度。
 
 ---
 
@@ -213,10 +206,10 @@ registered ──► waiting ──► building ──► ready ──► (TTL �
 | `error` | 构建失败或基础设施错误 | "error" |
 | （记录删除） | GC 扫描 TTL 到期，从 builds 表删除 | N/A |
 
-### 4.2 快照创建路径 A：构建 pipeline（e2b profile）
+### 4.2 快照创建路径 A：构建 pipeline（e2b profile；bare img-only 待支持，见 §4.9.5）
 
 ```
-node-ctl serve
+node-ctl conductor
 │
 ├─ API: POST /v3/templates
 │   └─ newRegisteredBuild
@@ -532,7 +525,8 @@ Request Body (JSON):
     "name": "my-template",             # 可选，template 可读名称
     "tags": ["v1", "stable"],          # 可选，别名列表
     "cpuCount": 2,                     # 可选，与 X-Kuasar-Sandbox-Resource 二选一
-    "memoryMB": 512                    # 可选，与 X-Kuasar-Sandbox-Resource 二选一
+    "memoryMB": 512,                   # 可选，与 X-Kuasar-Sandbox-Resource 二选一
+    "profile": "bare"                  # 可选，默认 "e2b"；"bare" 仅支持 img-only Phase A（待实现，见 §4.9.5）
   }
 
 Response 200:
@@ -590,7 +584,7 @@ Request Headers:
 Response 200:
   {
     "status": "building" | "ready" | "error",
-    "templateID": "<persistID>",      # ready 时填充（e2b-snp-<key> 或 e2b-img-<key>）
+    "templateID": "<persistID>",      # ready 时填充（e2b-snp-<key>、e2b-img-<key>、bare-img-<key> 等）
     "buildID": "<buildID>",
     "reason": { "message": "..." }    # error 时填充
   }
@@ -742,7 +736,7 @@ builder:
 
 #### 4.7.1 GC 触发机制
 
-`node-ctl serve` 启动时启动后台 goroutine `TemplateGC`，以 `builder.template_gc_interval_sec`（默认 1h）为周期定时扫描，逻辑如下：
+`node-ctl conductor` 启动时启动后台 goroutine `TemplateGC`，以 `builder.template_gc_interval_sec`（默认 1h）为周期定时扫描，逻辑如下：
 
 ```
 TemplateGC(ctx, interval)
@@ -800,7 +794,7 @@ builds 表记录删除后，manifest store 中对应的 image/snapshot 内容成
 
 #### 4.8.1 并发控制
 
-BuildPool 是 node-ctl serve 内的后台 goroutine，以固定 interval（默认 5s）tick，每轮扫描 `waiting` 状态的构建并尝试调度：
+BuildPool 是 node-ctl conductor 内的后台 goroutine，以固定 interval（默认 5s）tick，每轮扫描 `waiting` 状态的构建并尝试调度：
 
 ```
 BuildPool(ctx, interval=5s)
@@ -850,17 +844,19 @@ systemd (PID 1)
 
 阶段 sandbox 顺序执行（Phase A 结束后 Phase B 才启动），因此同一构建单元内同一时刻只有一个 Firecracker 进程存活，vswitch slot 也只占用一个。
 
-#### 4.8.3 node-ctl serve 重启恢复
+#### 4.8.3 node-ctl conductor 重启恢复
 
-serve 重启后，`pend` map 清空，正在运行的 `sandbox-builder@<bid>` 单元无法通过 config-socket 获取 BuildSpec，run-builder 退出并将构建置为 error。
+conductor 重启后，`pend` map 清空，正在运行的 `sandbox-builder@<bid>` 单元无法通过 config-socket 获取 BuildSpec，run-builder 退出并将构建置为 error。
 
 重启后 BuildPool 扫描到 `building` 状态的残留记录时，当前版本**不自动重试**（CAS 无法从 building 迁移到 waiting），需运维手动将状态重置为 waiting 后由下一个 tick 重新调度。
 
 ### 4.9 快照创建路径 B：pause + export（bare profile）
 
-#### 4.9.0 bare img 基础镜像预置
+#### 4.9.0 bare img 基础镜像预置（临时替代方案）
 
-bare sandbox 的启动依赖一个预先存入 manifest store 的 EROFS 基础镜像（`bare-img-<key>`）。该镜像不经过 node-ctl API，由运维人员在宿主机上通过 `flatten-ctl export` 直接产出并上传：
+> **临时替代方案**：本节描述的宿主机 CLI 流程是 Story 6 Phase A build 尚未实现期间的替代手段（Phase A bare profile 支持缺口见 §3.4 约束 6 和 §4.9.5）。Phase A 实现后，`bare-img-<key>` 可通过 `POST /v3/templates` + `POST /v2/templates/{tid}/builds/{bid}` 的 API 流程产出，无需登录节点。本节仍适用于**从本地 rootfs 目录产出**（§4.9.0 下方第二种用法）或批量预置等无法通过 API 触发的场景。
+
+bare sandbox 的启动依赖一个预先存入 manifest store 的 EROFS 基础镜像（`bare-img-<key>`）。该镜像由运维人员在宿主机上通过 `flatten-ctl export` 直接产出并上传：
 
 **从 OCI 镜像产出**（最常见）：
 
@@ -887,7 +883,9 @@ flatten-ctl export <rootfs-dir> \
 
 #### 4.9.1 适用场景
 
-bare profile sandbox 没有 envd 守护进程，无法由构建 pipeline（路径 A）驱动。当用户需要将一个已初始化好的 bare sandbox 运行时状态固化为可复用的启动基准时，使用 pause + export 路径：
+bare profile sandbox 没有 envd 守护进程，Phase B（RUN steps）和 Phase C（startCmd 快照）无法运行；但 Phase A img-only build 仅使用 `sandbox-ctl exec` 不依赖 envd，bare profile 可通过 build pipeline 产出 `bare-img-<key>`（见 §4.9.5，当前实现待支持）。
+
+pause + export 路径（路径 B）用于将已初始化好的 bare sandbox 运行时状态固化为可复用的启动基准，适用场景：
 
 - 基础系统镜像定制（在运行中的 sandbox 内安装软件包、写入配置文件）
 - 有状态进程预热（提前启动长初始化进程，对外提供极速 resume 能力）
@@ -900,7 +898,7 @@ bare profile sandbox 没有 envd 守护进程，无法由构建 pipeline（路�
 ```
 Operator / Automation
 │
-├─ [前提：宿主机执行 flatten-ctl export --upload → bare-img-<key>，详见 §4.9.0]
+├─ [前提：获取 bare-img-<key>，可通过 Phase A build API（见 §4.9.5）或宿主机 CLI（见 §4.9.0）产出]
 │
 ├─ POST /sandboxes {"templateID": "bare-img-<key>"}
 │   └─ Orch.CreateSandbox → 从 bare img 冷启动（profile=bare，无 envd）
@@ -930,7 +928,7 @@ Operator / Automation
 ```
 Client           API            Orchestrator      sandbox-ctl    manifest store
   │               │                   │                │                │
-  │  [前提：flatten-ctl export --upload → bare-img-<key>，见 §4.9.0]
+  │  [前提：bare-img-<key> 已就绪（Phase A build API（§4.9.5）或宿主机 CLI（§4.9.0）产出）]
   │ POST /sandboxes {"templateID":"bare-img-<key>"}    │                │
   │──────────────>│                   │                │                │
   │               │ CreateSandbox     │                │                │
@@ -968,33 +966,430 @@ Client           API            Orchestrator      sandbox-ctl    manifest store
   │               │                   │ assemble persist id: bare-snp-<key>
   │               │<──────────────────│                │                │
   │<──────────────│ {"result":"bare-snp-<key>"} │      │                │
-  │               │                   │                │                │
-  │  [后续：从快照极速启动]             │                │                │
-  │ POST /sandboxes                   │                │                │
-  │ {"templateID":"bare-snp-<key>"}   │                │                │
-  │──────────────>│                   │                │                │
-  │               │ CreateSandbox     │                │                │
-  │               │──────────────────>│                │                │
-  │               │                   │ sandbox-ctl --restore manifest://<key>
-  │               │                   │──────────────────────>          │
-  │               │                   │ VM resume（无冷启动）            │
-  │               │<──────────────────│                │                │
-  │<──────────────│  {sandboxID}      │                │                │
 ```
 
 #### 4.9.4 与路径 A 的设计对比
 
 | 维度 | 路径 A（构建 pipeline） | 路径 B（pause + export） |
 |------|------------------------|-------------------------|
-| 触发 API | `POST /v3/templates` + `POST /v3/templates/{id}/builds`（本特性新增） | `POST /sandboxes/{id}/pause` + `POST /sandboxes/{id}/export {"toTemplate":true}`（均为已有 API） |
-| 依赖 envd | 是（Phase B steps、Phase C startCmd/readyCmd） | 否 |
-| 适用 profile | e2b（硬编码） | bare（主要）、e2b 亦可 |
+| 触发 API | `POST /v3/templates` + `POST /v2/templates/{tid}/builds/{bid}`（本特性新增） | `POST /sandboxes/{id}/pause` + `POST /sandboxes/{id}/export {"toTemplate":true}`（均为已有 API） |
+| 依赖 envd | Phase B/C 依赖（RUN steps / startCmd/readyCmd）；Phase A img-only 仅用 `sandbox-ctl exec`，不依赖 envd | 否 |
+| 适用 profile | e2b；bare img-only（Phase A）待支持，见 §4.9.5 | bare（主要）、e2b 亦可 |
 | 构建状态机 | registered → waiting → building → ready/error | 无（export 成功即可直接使用） |
 | builds 表 | RegisterBuild/TriggerBuild/executeBuild 逐步写入 | 不写 builds 表，persist id 自描述（`bare-snp-<key>`） |
 | 失败重试 | 可重新 TriggerBuild | 需重新 pause + export |
 | overlay 链继承 | 支持（fromTemplate manifest://k1:k2:k3） | 不支持（每次 export 产生全量快照） |
 | 并发控制 | BuildPool 信号量 | 无（每次 export 是独立操作） |
 | 构建后源 sandbox | 构建 sandbox 由 runBuildUnit 清理 | `toTemplate=true` 时源 sandbox 行**始终保留**（keepSource 仅在迁移 token 模式下生效） |
+
+#### 4.9.5 设计缺口：Phase A bare profile 支持
+
+bare profile 通过 API 全流程产出基础镜像（`bare-img-<key>`，见 §3.1 Story 6）依赖 bare profile 能走 Phase A build。Phase A 技术上不需要 envd——它通过 `sandbox-ctl exec` 在 builder 沙箱内运行 `flatten-ctl export`，`waitExecReady` 等待的是 sandbox-ctl launch server（vsock 5000），与 envd 无关。
+
+当前阻塞点是三处硬编码 `ProfileE2B`：
+
+| 位置 | 当前代码 | 需改为 |
+|------|---------|--------|
+| `orch/build.go` `newRegisteredBuild` | `Profile: types.ProfileE2B` | 从 API 请求参数读取 profile（默认 e2b） |
+| `orch/build.go` `runBuildUnit` | `allocInnerIP(types.ProfileE2B, "")` | `allocInnerIP(b.Profile, "")` |
+| `orch/build.go` `BuildSpecFor` | `innerGateway(types.ProfileE2B)` | `innerGateway(b.Profile)` |
+
+消除上述三处硬编码后，bare profile 的 img-only build 路径即可走通，PersistID 将正确生成为 `bare-img-<key>`（`executeBuild` 中 `b.Profile` 传递到 `types.TemplateID{Profile: b.Profile, ...}.String()`，无需额外改动）。Phase B/C（RUN steps / startCmd）因依赖 envd 仍仅限 e2b profile，TriggerBuild 应在 bare profile 下拒绝携带 steps 或 startCmd 的请求。
+
+---
+
+## 4.10 集群模式 bare img Phase A 构建完整流程
+
+### 4.10.1 概述
+
+§4.2 描述的是 Client 直连单节点 node-ctl conductor 的构建路径。集群模式下，Client 连接的是
+**router**，router 通过 route-link 向 **registry** 发起 `ReserveBuild`，registry 通过
+**placer** 按 `build_capacity` 选节点、通过 **node-link** 下发 `CmdBuildRegister` 预配节点；
+后续 TriggerBuild / 状态查询由 router 直接转发到节点数据面（`DataEndpoint`），构建状态变更
+通过 node-link **build_event** 异步回报 registry（用于释放预扣资源）。
+
+bare img Phase A 场景：`fromImage` 非空、无 `steps`、无 `startCmd`，构建仅执行 Phase A，
+Finale 只产出 `bare-img-<key>`，整个流程不涉及 Phase B / Phase C。
+
+### 4.10.2 与单节点模式的对比
+
+| 维度 | 单节点（§4.2） | 集群（§4.10） |
+|------|--------------|-------------|
+| 客户端入口 | 直连 node-ctl API | Router 层（透明转发到目标节点） |
+| 节点选择 | 固定（本机） | placer P2C 按 `build_capacity` 选节点，最多重试 2 次 |
+| RegisterBuild | 节点写 builds 表 | router → registry `ReserveBuild` → `CmdBuildRegister` → 节点写 builds 表 |
+| TriggerBuild | 节点直接处理 | router `forwardBuild` → 节点 DataEndpoint |
+| 状态查询 | 节点直接返回 | router `forwardBuild`；router 重启后 `ResolveBuild` 恢复路由 |
+| 状态回报 | 仅本地日志 | node-link `build_event` → registry（驱动 `admitBuild` 预扣释放） |
+| 资源预扣 | BuildPool 信号量（节点侧） | registry `admitBuild`（集群侧）+ 节点 BuildPool 信号量（双层） |
+| image-pull 凭证 | TriggerBuild 请求体明文或加密存储 | `CmdBuildRegister.RegistryAuth` → 节点内存暂存，terminal 时清除 |
+| profile 传递 | API 请求 → `newRegisteredBuild` 直接读 | API 请求 → router metadata → `BuildReserveReq.Metadata` → `CmdBuildRegister.Config` → `registerClusterBuild` 读取 |
+
+### 4.10.3 完整调用链
+
+```
+Client
+│
+├─ POST /v3/templates
+│   {profile: "bare", cpuCount, memoryMB, name}           ← X-API-KEY
+│
+│   [Router handleBuildRegister]
+│       authorize(group by X-API-KEY)
+│       resources = parseResources(X-Kuasar-Sandbox-Resource / body.cpuCount/memoryMB)
+│       metadata = {"profile": "bare", ...}                ← profile 注入 Metadata
+│       buildID  = uuid.NewV7()
+│       templateID = "transient-" + uuid.NewV7()
+│
+│       POST /route-link/reserve-build
+│           {group, build_id, template_id, resources, metadata}
+│
+│       [Registry ReserveBuild]
+│           GetBuildInGroup(group, bid) → 已有则幂等返回
+│           for attempt 0..1:
+│               placer.Place(group, Build=true, Config=metadata)
+│                   → PlaceResult{NodeID, DataEndpoint,
+│                                 KeyFingerprint, ImageRepo, RegistryAuth}
+│               admitBuild(nodeID, bid, resources)
+│                   → NodeOwner.AdmitBuild → CAS 原子预扣 NodeBuildAlloc
+│                   失败（节点超额）→ releaseBuildAdmission，进入 attempt 1 重试
+│               PutBuild(BuildRecord{
+│                   Group, BuildID, NodeID, Resources,
+│                   State: BuildRegistered, TemplateID: templateID})
+│               AddNodeBuildRef(nodeID, {group, bid})
+│               SendCommandAndWait(CmdBuildRegister{
+│                   CmdID, Kind: CmdBuildRegister,
+│                   Group, BuildID, TemplateRef: templateID,
+│                   BuildResources, Config: metadata,        ← 含 "profile":"bare"
+│                   KeyFingerprint, ImageRepo, RegistryAuth
+│               }, 5s)
+│
+│               [Node HandleCommand → registerClusterBuild]
+│                   resolveByFingerprint(cmd.KeyFingerprint)
+│                       → st.AllowedManifestKeysByHash → manifestKey
+│                   PutBuild({
+│                       BuildID, TemplateID: cmd.TemplateRef,
+│                       ManifestKey,
+│                       Profile: cmd.Config["profile"] ?? ProfileE2B,  ← 需改动（见 §4.10.6）
+│                       Kind:    KindImg,
+│                       Status:  BuildRegistered,
+│                       FromImage: imageURIFromMask(templateRef, buildID),
+│                       Metadata: cmd.Config,
+│                       CreatedUnix: now,
+│                   })
+│                   clusterBuilds[bid] = {group, imageRepo, registryAuth}
+│                   publishBuildState(bid, "registered", "", "")
+│                       → buildEvents chan → node-link TypeBuildEvent（高优先级）
+│               ← CmdAck{AckAccepted}          ← 仅 receipt，不阻塞等待构建完成
+│
+│               ack 超时（5s，节点离线等）→ 乐观返回 BuildReserveResult
+│           BuildReserveResult{BuildID, TemplateID, NodeID, DataEndpoint}
+│
+│       router: builds[bid] = DataEndpoint     ← 路由缓存
+│   ← 202 {templateID: "transient-<uuid>", buildID: "<uuid>"}
+│
+├─ POST /v2/templates/{tid}/builds/{bid}
+│   {fromImage: "debian:bookworm-slim"}                    ← X-API-KEY，无 steps/startCmd
+│
+│   [Router handleBuildForward]
+│       builds[bid] 命中 → forwardBuild(DataEndpoint)
+│       miss（router 重启）→ GET /route-link/build?group=&build_id=
+│                            → ResolveBuild → 重建 builds[bid]
+│       httputil.ReverseProxy 转发，删除 X-Access-Token（build 侧用 X-API-KEY 鉴权）
+│       → NodeDataEndpoint /v2/templates/{tid}/builds/{bid}
+│
+│   [Node TriggerBuild]
+│       ownsBuild(bid, manifestKey derived from X-API-KEY)
+│       bare profile 校验：steps 非空 → 400；startCmd 非空 → 400
+│       fromImage 非空校验通过
+│       fromImage / fromTemplate 互斥检查
+│       resolveBuildCreds(bid):
+│           clusterBuildCreds(bid) → cmd.RegistryAuth（内存，不落盘）
+│       PutBuild(status: waiting, kind: img,
+│               fromImage: "debian:bookworm-slim",
+│               registryAuthEnc: AES-256(registryAuth))
+│   ← 200 {}
+│
+│   [BuildPool ticker 5s — 节点侧]
+│       BuildsByStatus(waiting) → [bid, ...]
+│       sem <- struct{}{}（获取信号量，容量 = max_concurrent）
+│       CASBuildStatus(bid, waiting → building) → won=true
+│       go executeBuild(b):
+│
+│           runBuildUnit(b)
+│               mkdir <RunRoot>/<bid>/
+│               allocInnerIP(b.Profile, "")               ← 需改动（见 §4.10.6）
+│               vs.Attach(port) → {MAC, FloatingIP, TapFDExec}
+│               keys.MintToken() → envdToken
+│               pend[bid] = pendingBuild{port, envdToken, group, ...}
+│               [MMDS] cache synthetic route (build-<bid>, FloatingIP)
+│                      publishUpsert(build-<bid>)
+│               lc.Start("sandbox-builder@<bid>.service")  ← Type=oneshot，阻塞至退出
+│
+│   [run-builder (systemd ExecStart, cgroup 隔离)]
+│       configsock.FetchBuildSpec("build:<bid>")           ← UDS，SO_PEERCRED 鉴权
+│
+│           [Node BuildSpecFor(bid)]
+│               pend[bid] 读取
+│               innerGateway(b.Profile)                    ← 需改动（见 §4.10.6）
+│               Env: {MANIFEST_KEY: <64hex>, FLATTEN_REGISTRY_*: ...}
+│               Net: {InnerIP, InnerGateway, MAC, FloatingIP, TapFDExec}
+│               FromImage: "debian:bookworm-slim"
+│               Steps: []          （bare Phase A 无 steps）
+│               StartCmd: ""       （bare 无 startCmd）
+│               FromTemplate: ""   （纯 fromImage 构建）
+│               MMDSEnabled: <config>
+│               VCPU, Memory: builder 节配置
+│               Timeouts: {Pull:300s, Step:120s, Ready:120s, Total:1800s}
+│           ← BuildSpec
+│
+│       builder.Run(spec)
+│           resolveBase:
+│               spec.FromTemplate="" → 跳过
+│               baseRef = spec.FromImage = "debian:bookworm-slim"
+│
+│           phaseImport (Phase A)：
+│               importYAML():
+│                   base: cfg.Builder.RuntimeBuilder（builder-runtime rootfs）
+│                   disk: empty（空盘，不依赖 base 内容）
+│                   launch.placeholder = true
+│                   挂载 /opt/sandbox-runtime 工具链
+│               startSandbox("a", importYAML, no envdUDS)
+│                   exec.Command("sandbox-ctl run
+│                       --config a.yaml
+│                       --sandbox-id bp-a-<8hex>")
+│               waitExecReady(60s):
+│                   poll "flatten-ctl mountpoint /.probe"
+│                   300ms 间隔，每次 10s 超时
+│               sb.exec(tenantEnv,
+│                        "flatten-ctl export --output - debian:bookworm-slim")
+│                   sandbox-ctl exec
+│                       --sandbox-id bp-a-<8hex>
+│                       --env FLATTEN_REGISTRY_AUTH=<creds>
+│                       --env FLATTEN_REGISTRY_HOST=<host>
+│                       --stdout-to <workdir>/image.img
+│                       -- flatten-ctl export --output - debian:bookworm-slim
+│                   [guest 内]
+│                       flatten-ctl 拉取 OCI 层 → flatten → EROFS stream
+│                       stdout pipe → workdir/image.img
+│               sb.teardown(): SIGTERM → 20s → SIGKILL
+│
+│           phaseSteps:   steps=[] → 跳过
+│           phaseTemplate: startCmd="" → 跳过
+│
+│           finale:
+│               bundle="" → 跳过 uploadSnapshot
+│               imagePath = workdir/image.img →
+│                   uploadImage:
+│                       manifest-ctl store
+│                           --no-progress
+│                           --manifest-config <manifest-config>
+│                           workdir/image.img
+│                       → ImageKey（64-hex）
+│               return BuildResult{ImageKey: <key>}
+│           写 stdout: {"image_key":"<key>"}   ← <bid>.result
+│
+│   [runBuildUnit：lc.Start 返回（单元已退出）]
+│       read <RunRoot>/<bid>/<bid>.result → {image_key: "<key>"}
+│       lc.Stop("sandbox-builder@<bid>")
+│       lc.ResetFailed("sandbox-builder@<bid>")
+│       vs.Detach(port)
+│       uncache + publishDelete (synthetic route build-<bid>)
+│       delete pend[bid]
+│       os.RemoveAll(<RunRoot>/<bid>/)
+│
+│       PersistID = types.TemplateID{
+│           Profile: b.Profile,  // "bare"
+│           Kind:    KindImg,
+│           Key:     <ImageKey>,
+│       }.String()  =  "bare-img-<ImageKey>"
+│
+│       PutBuild(status: ready, PersistID: "bare-img-<ImageKey>")
+│       publishBuildState(bid, "ready", "bare-img-<ImageKey>", "")
+│           clusterBuilds[bid] → buildEvents chan → node-link TypeBuildEvent
+│               （高优先级 outbox，优先于 heartbeat）
+│           terminal → delete clusterBuilds[bid]  ← 清除内存中的 registryAuth
+│
+│   [Registry applyBuildEvent（via node-link 上行）]
+│       GetBuildInGroup(group, bid)
+│       rec.State    = "ready"
+│       rec.TemplateID = "bare-img-<ImageKey>"
+│       PutBuild(rec)
+│       !rec.occupies() →
+│           releaseBuildAdmission(bid)  ← NodeOwner.ReleaseBuild → 还原 NodeBuildAlloc
+│           RemoveNodeBuildRef(nodeID, group, bid)
+│
+│   [executeBuild 收尾]
+│       <- sem                   ← 释放 BuildPool 信号量槽位
+│
+├─ GET /templates/{tid}/builds/{bid}/status  （客户端轮询）
+│   [Router handleBuildForward]
+│       builds[bid] 命中 → forwardBuild(DataEndpoint)
+│       → Node /templates/{tid}/builds/{bid}/status
+│           GetBuild(bid) → {status:"ready", templateID:"bare-img-<ImageKey>"}
+│   ← {status: "ready", templateID: "bare-img-<ImageKey>"}
+│
+└─ POST /sandboxes {"templateID": "bare-img-<ImageKey>"}
+       正常 Reserve + Create 流程（cluster.md §8）
+       registry placer.Place(Build=false) → CmdCreate → 节点冷启动 bare sandbox
+       importYAML 配置，无 envd，无 Phase B/C 依赖
+```
+
+### 4.10.4 时序图
+
+```mermaid
+sequenceDiagram
+    participant C  as Client
+    participant R  as Router
+    participant RG as Registry
+    participant PL as Placer
+    participant N  as Node (node-ctl)
+    participant SB as sandbox-builder@bid
+    participant MS as manifest store
+
+    C->>R:  POST /v3/templates {profile:"bare"} X-API-KEY
+    R->>RG: POST /route-link/reserve-build<br/>{group, bid, template_id, resources, metadata:{profile:bare}}
+    RG->>PL: Place(group, Build=true, Config={profile:bare})
+    PL->>PL: P2C 按 build_capacity 选节点
+    PL-->>RG: PlaceResult{NodeID, DataEndpoint, KeyFingerprint, RegistryAuth}
+    RG->>RG: admitBuild(nodeID, bid, resources) CAS 预扣 NodeBuildAlloc
+    RG->>RG: PutBuild(registered) + AddNodeBuildRef
+    RG->>N:  CmdBuildRegister{bid, templateRef, Config:{profile:bare},<br/>KeyFingerprint, RegistryAuth}
+    N->>N:  registerClusterBuild:<br/>resolveByFingerprint → manifestKey<br/>PutBuild(profile=bare, status=registered)<br/>clusterBuilds[bid]={registryAuth}
+    N->>RG: build_event{bid, state:registered}  (via node-link)
+    N-->>RG: CmdAck{Accepted}
+    RG-->>R: BuildReserveResult{bid, templateID, DataEndpoint}
+    R->>R:  builds[bid] = DataEndpoint
+    R-->>C: 202 {templateID:"transient-<uuid>", buildID}
+
+    C->>R:  POST /v2/templates/{tid}/builds/{bid}<br/>{fromImage:"debian:bookworm-slim"}
+    R->>N:  forwardBuild → /v2/templates/{tid}/builds/{bid}
+    N->>N:  TriggerBuild:<br/>bare profile 拒绝 steps/startCmd<br/>resolveBuildCreds → clusterBuildCreds<br/>PutBuild(status=waiting, kind=img)
+    N-->>R: 200
+    R-->>C: 200
+
+    Note over N: BuildPool tick 5s
+    N->>N:  CASBuildStatus(waiting→building)
+    N->>N:  allocInnerIP(ProfileBare) + vs.Attach → port
+    N->>N:  pend[bid]={port, envdToken, ...}
+    N->>SB: lc.Start(sandbox-builder@bid.service)
+
+    SB->>N: configsock FetchBuildSpec("build:bid")
+    N->>N:  BuildSpecFor(bid): fromImage, env, innerGateway(bare)
+    N-->>SB: BuildSpec
+
+    Note over SB: Phase A
+    SB->>SB: startSandbox("a", importYAML)
+    SB->>SB: waitExecReady(60s)
+    SB->>SB: exec flatten-ctl export debian:bookworm-slim → image.img
+
+    Note over SB: Finale (img only)
+    SB->>MS: manifest-ctl store image.img
+    MS-->>SB: ImageKey (64-hex)
+    SB->>SB: write result JSON → stdout {image_key}
+
+    SB-->>N: lc.Start returns（单元退出）
+    N->>N:  read result → bare-img-<ImageKey>
+    N->>N:  PutBuild(status=ready, PersistID=bare-img-<ImageKey>)
+    N->>N:  publishBuildState("ready","bare-img-<ImageKey>")
+    N->>RG: build_event{bid, state:ready, template_id:bare-img-<ImageKey>} (node-link)
+    RG->>RG: applyBuildEvent:<br/>PutBuild(rec)<br/>releaseBuildAdmission(bid)<br/>RemoveNodeBuildRef
+    N->>N:  vs.Detach + cleanup workdir + <-sem
+
+    loop 轮询
+        C->>R:  GET /templates/{tid}/builds/{bid}/status
+        R->>N:  forwardBuild → /templates/{tid}/builds/{bid}/status
+        N-->>R: {status:"ready", templateID:"bare-img-<ImageKey>"}
+        R-->>C: {status:"ready", templateID:"bare-img-<ImageKey>"}
+    end
+```
+
+### 4.10.5 关键设计要点
+
+#### 节点选择与资源预扣
+
+placer `Place(Build=true)` 从 node_list 中过滤掉 `draining=true` 的节点，通过 P2C 选取
+`build_capacity` 最大的两个候选节点中负载较低者。registry 在 placer 返回后立即调用
+`admitBuild` CAS 原子预扣 `NodeBuildAlloc`，防止并发 Place 对同一节点超额分配（node 侧
+heartbeat 更新有延迟，registry 是资源预扣的权威）。预扣量 = `BuildReserveReq.Resources`（
+由 router 从请求头/body 解析，未指定则 `defaultBuildResources = {1 core, 1 GiB}`）。
+
+构建 terminal 状态（ready / error）时，node 通过 `build_event` 回报，registry
+`applyBuildEvent` 调用 `releaseBuildAdmission` 还原预扣。若 node 离线导致事件丢失，
+NodeBuildAlloc 预扣不自动释放，需等待 `sweepNode` 死节点清理或运维手动重置。
+
+#### CmdBuildRegister 非阻塞语义
+
+`SendCommandAndWait` 最多等待 5s ack。ack 只是受理回执（synchronous preconditions 通过：key
+fingerprint 能解析出 manifestKey），不等构建完成。超时（节点瞬时繁忙或重启中）时 registry 乐
+观返回 `BuildReserveResult`，router 照常缓存 `DataEndpoint`，后续 TriggerBuild 由 router
+转发到节点侧，节点重启后会重注册并重报沙箱集（此时 builds 表记录仍在），BuildPool 可从
+`registered` / `waiting` 状态正常调度。
+
+#### forwardBuild 路径与 router 重启恢复
+
+router 内存 `builds[bid] = DataEndpoint` 是热路径缓存。router 重启后缓存丢失，
+`handleBuildForward` 回退到 `routeLinkResolveBuild`（`GET /route-link/build?group=&build_id=`）
+向 registry 查询 `BuildRecord.NodeID` → `nodeDataEndpoint`，重建缓存后再转发。
+`forwardBuild` 删除 `X-Access-Token` header（build 侧以 `X-API-KEY` 鉴权，节点验证
+`clusterBuildCreds` 中的 `manifestKey`）。
+
+#### profile 在集群链路上的传递
+
+```
+Client body {"profile":"bare"}
+  → Router: metadata["profile"] = "bare"
+  → BuildReserveReq.Metadata["profile"] = "bare"
+  → CmdBuildRegister.Config["profile"] = "bare"
+  → registerClusterBuild: b.Profile = cmd.Config["profile"] ?? ProfileE2B
+  → TriggerBuild: b.Profile 已正确，bare 校验生效
+  → runBuildUnit: allocInnerIP(b.Profile)
+  → BuildSpecFor: innerGateway(b.Profile)
+  → executeBuild: PersistID = "bare-img-<key>"
+```
+
+`ProfileBare` 在 Phase A 技术上与 `ProfileE2B` 的区别：builder-runtime rootfs 均适用（均为
+通用工具链镜像）；差异在 `importYAML` 的 `launch.exec` 字段（bare 不启动 envd）和
+`innerGateway` 的网络配置（IP 段可能不同）。Phase B/C 不被 bare profile 触发，
+TriggerBuild 层面提前拒绝。
+
+#### 构建状态流的双轨
+
+| 轨道 | 路径 | 消费方 | 用途 |
+|------|------|--------|------|
+| 节点本地 | `PutBuild` → builds 表 | router `forwardBuild` 转发的客户端状态查询 | 对外 API 状态 |
+| 集群上行 | `publishBuildState` → node-link `build_event` → registry `applyBuildEvent` | registry `BuildRecord`、`NodeBuildAlloc` | 资源预扣释放、集群级别 build 追踪 |
+
+两轨状态异步收敛，terminal 状态一致（node 先写本地，再发事件）。
+
+### 4.10.6 集群模式 bare profile 所需改动
+
+在 §4.9.5 单节点改动基础上，集群模式额外需要以下改动：
+
+| 位置 | 当前状态 | 需改为 |
+|------|---------|--------|
+| `orch/cluster.go` `registerClusterBuild` line 125 | `Profile: types.ProfileE2B` 硬编码 | `Profile: types.ProfileFromString(cmd.Config["profile"], types.ProfileE2B)` |
+| `internal/registry/build.go` `ReserveBuild` | `CmdBuildRegister` 不显式携带 profile，依赖 `Config` 透传 | 无需改结构，确认 `Config: req.Metadata` 已透传（当前代码已透传，无需改动） |
+| `internal/router/router.go` `handleBuildRegister` | metadata 组装时是否提取 body `profile` 字段 | 确认从请求 body 读取 `profile` 并注入 `BuildReserveReq.Metadata` |
+| `orch/build.go` `TriggerBuild` | 未对 bare profile 拒绝 steps/startCmd | 在 `TriggerBuild` 校验段增加：`if b.Profile == ProfileBare && (len(steps)>0 || startCmd!="") { return 400 }` |
+
+单节点改动（§4.9.5）在集群模式下同样必须：
+
+| 位置 | 需改为 |
+|------|--------|
+| `orch/build.go` `runBuildUnit` `allocInnerIP` | `allocInnerIP(b.Profile, "")` |
+| `orch/build.go` `BuildSpecFor` `innerGateway` | `innerGateway(b.Profile)` |
+
+上述改动合计 5 处，`registerClusterBuild` 改动是集群模式独有的，其余 3 处与单节点共享。
+
+### 4.10.7 故障场景补充（集群特有）
+
+| 故障场景 | 系统行为 | 恢复手段 |
+|---------|---------|---------|
+| `CmdBuildRegister` ack 超时（节点瞬时离线） | registry 乐观返回，router 缓存 DataEndpoint；节点重连后重注册，builds 表记录仍在，后续 TriggerBuild 正常转发 | 无需干预，节点重连后 BuildPool 可继续调度 |
+| `CmdBuildRegister` 被 reject（key fingerprint 解析失败） | registry 回滚 `PutBuild` + `RemoveNodeBuildRef` + `releaseBuildAdmission`，进入 attempt 1 重试 | 检查 key 是否已通过 node-link `CmdKeyPut` 分发到目标节点 |
+| router 重启（builds 缓存丢失） | 首次 forwardBuild miss → `routeLinkResolveBuild` 查 registry → 重建缓存 | 自动恢复，对客户端透明 |
+| node 构建中下线（node-link 断开） | registry `applyBuildEvent` 不再收到 terminal 事件，`NodeBuildAlloc` 预扣不自动释放；node 重连后 BuildPool 扫到 `building` 状态不自动重试 | 运维手动将 builds 表状态重置为 `waiting`；`NodeBuildAlloc` 在 `sweepNode` 死节点清理时随 `NodeRecord` 一起清除 |
+| manifest store 不可达（Finale 失败） | run-builder stdout 写 `{"error":"..."}`, `lc.Start` 返回后 `runBuildUnit` 读到 error，`publishBuildState("error")` → node-link → registry 释放预扣 | 网络恢复后重新 TriggerBuild（需运维将状态从 error 重置为 waiting，或重新 RegisterBuild） |
 
 ---
 
@@ -1025,7 +1420,7 @@ Phase A/B 中 `flatten-ctl` 在 guest 内运行，拉镜像流量经过租户网
 |---------|---------|---------|
 | Phase sandbox OOM | sandbox-ctl 进程退出，`lc.Start` 返回错误 | executeBuild 将 build 置为 error，释放 vswitch slot |
 | manifest store 不可达 | `uploadImage`/`uploadSnapshot` 返回错误，run-builder 输出 `error` 字段 | build 置为 error，网络恢复后需重新触发构建 |
-| node-ctl serve 重启 | `pend` map 丢失，`BuildSpecFor` 返回 not found | 运行中的 `sandbox-builder@<bid>` 单元无法获取 spec，构建失败；重启后 BuildPool 扫描 `building` 状态并重置（需额外实现，当前版本不自动重试） |
+| node-ctl conductor 重启 | `pend` map 丢失，`BuildSpecFor` 返回 not found | 运行中的 `sandbox-builder@<bid>` 单元无法获取 spec，构建失败；重启后 BuildPool 扫描 `building` 状态并重置（需额外实现，当前版本不自动重试） |
 | vswitch Attach 失败 | `runBuildUnit` 直接返回 error | build 置为 error，vswitch 未占用，自动释放 |
 | readyCmd 超时 | `phaseTemplate` 返回超时 error | build 置为 error，Phase C sandbox 通过 `defer sb.teardown()` 清理 |
 
@@ -1061,4 +1456,4 @@ Phase A/B 中 `flatten-ctl` 在 guest 内运行，拉镜像流量经过租户网
 ### 6.6 数据可靠性设计
 
 - manifest store 写入为原子操作（`sandbox-ctl upload-snapshot` 先写临时路径后 rename），上传失败不会产生部分可见的快照键。
-- 构建记录在 builds 表中持久化，`node-ctl serve` 重启后状态可恢复查询（不自动重试 building 状态，需运维手动重置或重新触发）。
+- 构建记录在 builds 表中持久化，`node-ctl conductor` 重启后状态可恢复查询（不自动重试 building 状态，需运维手动重置或重新触发）。
