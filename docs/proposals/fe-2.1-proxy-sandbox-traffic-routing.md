@@ -1414,28 +1414,34 @@ sandbox-vswitch 是 kuasar-sandbox 的 L2/L3 数据面底座，proxy 的用户�
 │                      │                    │               │
 └──────────────────────┼────────────────────┼───────────────┘
                        │ veth pair          │ GENEVE 隧道（跨节点出口）
-┌──────────────────────┼────────────────────┼─── sw0_vswitch netns ───────────────┐
-│                      │                    │                                      │
-│                    sw-mX           transit NIC attach                            │
-│                 TC ingress_mx      TC ingress_transit                            │
-│                      │                    │                                      │
-│                      └────────────────────┘                                      │
-│                           bpf_redirect(slot->ifindex)                            │
-│                                   │                                              │
-│                                   ▼                                              │
-│                           sw0-tN  (tap device，持久化)                           │
-│                           TC ingress_nx                                          │
-│                                                                                  │
-│  每个设备挂载 TC ingress eBPF 程序（shared block）                               │
-│  BPF map pin 在 bpffs → 控制面进程退出后数据面不中断                            │
-└──────────────────────────────────┬───────────────────────────────────────────────┘
-                                   │ tap fd（SCM_RIGHTS）
-                          cloud-hypervisor（virtio-net backend）
-                                   │ virtio-net virtqueue
-                               guest netns
+┌──────────────────────┼────────────────────┼─── sw0_vswitch netns ──────────────────────────────┐
+│                      │                    │                                                     │
+│                    sw-mX           transit NIC attach                                           │
+│                 TC ingress_mx      TC ingress_transit                                           │
+│                      │                    │                                                     │
+│                      └────────────────────┘                                                     │
+│                           bpf_redirect(slot->ifindex)                                           │
+│                                   │                                                             │
+│                                   ▼                                                             │
+│                           sw0-tN  (tap device，TUNSETPERSIST 持久化)                           │
+│                           TC ingress_nx                                                         │
+│                                   │                                                             │
+│                    tap fd（open-port 在此 netns 内打开，SCM_RIGHTS 交接）                      │
+│                                   │                                                             │
+│                          cloud-hypervisor（virtio-net backend）                                 │
+│                          ← tapfd 模式：sandbox-ctl startCH() setns 进入此 netns fork CH        │
+│                          ← tap-name 模式：CH 在 host root netns，tap fd 跨 netns 可用          │
+│                                   │ virtio-net virtqueue                                        │
+│                             ┌─────┴──────┐                                                     │
+│                             │ guest netns │  （KVM 硬件隔离，与宿主机任何 netns 均独立）       │
+│                             └────────────┘                                                     │
+│                                                                                                 │
+│  每个设备挂载 TC ingress eBPF 程序（shared block）                                              │
+│  BPF map pin 在 bpffs → 控制面进程退出后数据面不中断                                           │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**图二：用户端口数据面路径**
+**图二：用户端口数据面路径（tapfd 模式，CH 在 switch netns）**
 
 ```
                        客户端 SDK
@@ -1444,48 +1450,57 @@ sandbox-vswitch 是 kuasar-sandbox 的 L2/L3 数据面底座，proxy 的用户�
                      cluster-router
                            │
                            ▼
-┌──────────────────────────────────────────────── host root netns ──────────────────────────────────┐
-│                                                                                                    │
-│   node-proxy ◄──── 本节点回程（sw-mX → mg0，SNAT src inner_ip→floatingIP）                        │
-│       │                                                          transit NIC (eth1)                │
-│       │ 本节点入向 dial(floatingIP:PORT)                         ▲              │                  │
-│       │ 内核路由: floatingIP/20 → mg0                    跨节点出│        跨节点入│                  │
-│       ▼                                                  GENEVE封│        GENEVE解│                 │
-│      mg0                                                     装  │         封装  │                  │
-│       │ veth pair                                                 │               │                 │
-│  ─────┼──────────────────────────────── sw0_vswitch netns ───────┼───────────────┼──────────────── │
-│       │                                                           │               │                 │
-│       ▼                          bpf_redirect(slot->ifindex)      │               │                 │
-│     sw-mX ──────────────────────────────────────────────────► sw0-tN ◄───────────┘                 │
-│  TC ingress_mx                                               TC ingress_nx                          │
-│  DNAT: floatingIP → inner_ip                                 SNAT: inner_ip → floatingIP           │
-│                                                                    │                                │
-│  ─────────────────────────────────────────────────────────────────┼───────────────────────────────  │
-│                                                                    │ tap fd（SCM_RIGHTS）            │
-│                                       cloud-hypervisor ◄──────────┘                                │
-│                                       （virtio-net backend）                                        │
-└───────────────────────────────────────────────┬────────────────────────────────────────────────────┘
-                                                │ virtio-net virtqueue
-                               ┌────────────────┴──────────────────┐
-                               │           guest netns              │
-                               │       virtio-net NIC               │
-                               │             │                      │
-                               │       user app:PORT                │
-                               └────────────────────────────────────┘
+┌──────────────────────────────────── host root netns ───────────────────────────────────────────┐
+│                                                                                                 │
+│   node-proxy ◄──── 本节点回程（sw-mX → mg0，SNAT src inner_ip→floatingIP）                     │
+│       │                                                     transit NIC (eth1)                  │
+│       │ 本节点入向 dial(floatingIP:PORT)                    ▲              │                    │
+│       │ 内核路由: floatingIP/20 → mg0               跨节点出│        跨节点入│                  │
+│       ▼                                             GENEVE封│        GENEVE解│                  │
+│      mg0                                                装  │         封装  │                   │
+│       │ veth pair                                            │               │                  │
+└───────┼──────────────────────────────────────────────────────┼───────────────┼──────────────────┘
+        │              sw0_vswitch netns                        │               │
+┌───────┼───────────────────────────────────────────────────────┼───────────────┼──────────────────┐
+│       ▼                      bpf_redirect(slot->ifindex)       │               │                  │
+│     sw-mX ──────────────────────────────────────────────► sw0-tN ◄────────────┘                  │
+│  TC ingress_mx                                           TC ingress_nx                            │
+│  DNAT: floatingIP→inner_ip                               SNAT: inner_ip→floatingIP               │
+│                                                               │                                   │
+│                                                    tap fd（在此 netns 内持有）                    │
+│                                                               │                                   │
+│                                          cloud-hypervisor ◄───┘                                   │
+│                                          （virtio-net backend）                                    │
+│                                          ← setns 进入此 netns（tapfd 模式）                       │
+│                                                               │ virtio-net virtqueue               │
+│                                              ┌────────────────┴──────────────────┐                │
+│                                              │           guest netns              │                │
+│                                              │       virtio-net NIC               │                │
+│                                              │             │                      │                │
+│                                              │       user app:PORT                │                │
+│                                              └────────────────────────────────────┘               │
+└─────────────────────────────────────────────────────────────────────────────────────────────────── ┘
 ```
 
 控制面（`vswitch serve` / `vswitch-ctl`）只负责配置 BPF map 和管理 netns；一旦 `start` 完成，转发逻辑完全在内核 TC eBPF 程序中执行，控制面进程退出不影响已建立连接。
 
-**用户端口完整数据面路径（tap 模式）**
+**CH 所在 netns 取决于网络获取模式**
+
+| 模式 | 配置 | CH netns | 说明 |
+|------|------|---------|------|
+| tapfd（生产）| `network.tapfd.exec: [vswitch-ctl, open-port, ...]` | **sw0_vswitch netns** | `open-port` 发送 switch netns fd；`startCH()` `setns(CLONE_NEWNET)` 后 fork |
+| tap-name（开发/测试）| `network.tap: <tap-name>` | **host root netns** | 无 tapfd 交接，`netnsFile == nil`，CH 直接 `cmd.Start()` |
+
+tap fd 本身跨 netns 可用（内核对象引用），tap-name 模式下 CH 虽在 root netns 仍可驱动 switch netns 内的 tap 设备。
+
+**用户端口完整数据面路径**
 
 | 子路径 | 方向 | 路径 |
 |--------|------|------|
-| 本节点 node-proxy | 入向 | node-proxy → mg0(root netns) → veth → sw-mX TC DNAT(floatingIP→inner_ip) → bpf_redirect → sw0-tN tap fd → CH virtio-net → guest user app |
+| 本节点 node-proxy | 入向 | node-proxy(root netns) → mg0 → veth → sw-mX TC DNAT(floatingIP→inner_ip) → bpf_redirect → sw0-tN tap fd → CH(switch netns) virtio-net → guest |
 | 本节点 node-proxy | 回程 | guest → CH virtio-net → tap → sw0-tN TC SNAT(inner_ip→floatingIP) → sw-mX → mg0 → node-proxy |
-| 跨节点 GENEVE | 入向 | transit NIC → TC eBPF(GENEVE 解封装) → sw0-tN → tap fd（CH 持有）→ CH virtio-net backend → guest 网卡 → user app |
-| 跨节点 GENEVE | 出向 | guest 网卡(virtio-net) → CH virtio-net backend → tap fd → sw0-tN → TC eBPF(GENEVE 封装) → transit NIC → 外部网关 |
-
-cloud-hypervisor 是 vswitch tap 设备与 guest virtio-net 之间的桥接层：持有 tap fd（通过 `vswitch-ctl open-port` SCM_RIGHTS 交接），以用户态读写原始 Ethernet 帧，经 virtio-net virtqueue 送入/收自 guest，无需任何 netns 间通道。
+| 跨节点 GENEVE | 入向 | transit NIC → TC eBPF(GENEVE 解封装) → bpf_redirect → sw0-tN → tap fd → CH virtio-net backend → guest 网卡 → user app |
+| 跨节点 GENEVE | 出向 | guest → CH virtio-net backend → tap fd → sw0-tN TC SNAT + GENEVE 封装 → transit NIC → 外部网关 |
 
 #### 4.12.2 端口模式
 
@@ -1796,6 +1811,174 @@ proxy worker 不暴露独立健康探针端点；node-proxy@.service 的存活�
 ### 6.8 数据可靠性设计
 
 routesync 路由表为**纯内存状态**，proxy 进程重启后通过全量重同步从 serve 恢复，无持久化需求；路由真相源为 serve 的 SQLite `sandboxes` 表，proxy 不维护独立状态，无数据一致性风险。
+
+---
+
+## 7. 安全设计
+
+### 7.1 数据面认证模型
+
+proxy 对每条入站连接执行 `X-Access-Token` 校验（`AuthMiddleware`），令牌来源于 `RouteEntry.AccessToken`，由 routesync 从 serve 推送（sandbox 创建时生成，`connect/create` 响应体携带）。
+
+| 模式 | 行为 |
+|------|------|
+| `AuthOff` | 跳过所有 token 校验（开发/测试用） |
+| `AuthLog` | 校验失败记录日志，不拒绝请求 |
+| `AuthEnforce` | `ConstantTimeCompare`；不匹配返回 401（**生产必须使用**） |
+
+`authorized()` 有三个豁免条件（`auth.go:20-25`），任一成立即直接放行：
+
+| 豁免条件 | 代码位置 | 说明 |
+|---------|---------|------|
+| `authMode == AuthOff` | `auth.go:20` | 全局关闭校验 |
+| `route.AccessToken == ""` | `auth.go:20` | 路由无 token（当前 bare profile 实际不走此路径，见风险 2）|
+| `r.URL.Query().Get("signature") != ""` | `auth.go:23` | envd pre-signed 文件 URL；签名由 envd 在 guest 内校验，proxy 不重复校验 |
+
+### 7.2 e2b profile 与 bare profile 安全层次对比
+
+`RouteForTarget`（`proxy.go`）对两种 profile 生成不同的路由类型，导致安全纵深不同：
+
+| 维度 | e2b profile | bare profile |
+|------|-------------|--------------|
+| 控制端口（49983/49999）| KindUDS，proxy 校验 `X-Access-Token` | KindDeny，直接拒绝（501）|
+| 用户端口（其他）| KindTCP，proxy 校验 `X-Access-Token` | KindTCP，proxy 校验 `X-Access-Token` |
+| Guest 内鉴权 | envd 额外校验 `X-Access-Token`（纵深防御）| 无（无 envd，in-guest 无认证层）|
+| 浮动 IP 直连暴露面 | envd 仍会拒绝未授权请求 | VM 监听端口直接裸露，无 fallback |
+
+**vswitch 已提供的结构性隔离**：vswitch eBPF 程序不存在 port→port 转发路径，ARP 全代答，sandbox 间通信在数据面上被结构性阻断（`vswitch.md §1.2`）。因此攻击面不在 sandbox 互访，而在**宿主机进程绕过 proxy 直连浮动 IP**。
+
+### 7.3 已识别风险
+
+#### 风险 1：宿主机进程直连浮动 IP（bare profile 单点防御）
+
+**描述**：proxy 的 `X-Access-Token` 校验是 bare profile 的唯一认证层。宿主机上能访问浮动 IP 段的任意进程（含受攻击的运维工具、异常 sandbox-ctl 等）可绕过 proxy 直接建立 TCP 连接到 bare sandbox 的监听端口，此时无任何认证保障。
+
+**代码依据**：`proxy.go RouteForTarget`（bare 非控制端口返回 `KindTCP`，无 in-guest 兜底）；`auth.go:20` 豁免条件（`route.AccessToken == ""` 直接放行）。
+
+**影响**：若浮动 IP 网络隔离失效，攻击者可无鉴权访问 bare sandbox 内任意监听端口。e2b profile 不受此影响（envd 仍校验 token）。
+
+#### 风险 2：`EnvdAccessToken` 语义歧义引发的潜在认证降级
+
+**描述**：`Route.AccessToken` 的 struct 注释为 `"" = no data-plane auth, e.g. bare"`，配套测试也传入空 token 给 bare profile（`proxy_test.go`），与当前实现（`orch.go:452` 传入 `sb.EnvdAccessToken`）存在分歧。若未来开发者依注释"修正"实现，会使 bare profile TCP 路由的 `AccessToken` 变为空，触发 `auth.go:20` 豁免，关闭 proxy 层认证。
+
+**代码依据**：`RouteForTarget` 注释 `"" = no data-plane auth, e.g. bare"`；`auth.go:20` 当 `route.AccessToken == ""` 时直接返回 `true`。
+
+**影响**：一次"修复注释不一致"的 PR 即可误关闭 bare profile 的唯一认证层。
+
+#### 风险 3：`AuthOff` 全局豁免与 bare profile 共存
+
+**描述**：`auth.mode=off` 关闭所有 token 校验，无论 profile 类型。当节点同时承载 bare profile sandbox 时，`AuthOff` 会使 bare sandbox 的所有 TCP 端口完全无保护。当前无配置校验阻止两者共存。
+
+**代码依据**：`auth.go:20` `mode == config.AuthOff → return true`；§4.0.6 启动校验注释仅覆盖 MMDS + off 场景，未覆盖 bare + AuthOff 场景。
+
+**影响**：运维失误（忘记切换回 AuthEnforce）导致生产 bare sandbox 完全无认证暴露。
+
+### 7.4 消减方案
+
+#### P0：消除代码层歧义（极低成本，无行为变化）
+
+**措施 A：token 语义分离**
+
+将 bare profile 的代理认证 token 从 `EnvdAccessToken` 切换为 `TrafficAccessToken`，两者均在 sandbox 创建时生成、经 routesync 下推，当前仅 `EnvdAccessToken` 被路由使用，`TrafficAccessToken` 语义上即为数据面流量 token。
+
+此修改涉及两条代码路径，均须同步修改：
+
+**路径 1（internal mode）：`orch.go:452`**
+
+```go
+// orch.go — RouteForTarget 调用处（当前 ~line 452）
+token := sb.EnvdAccessToken
+if sb.Profile() == types.ProfileBare {
+    token = sb.TrafficAccessToken  // bare: 数据面 token，与 envd token 解耦
+}
+return proxy.RouteForTarget(string(sb.Profile()), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP, token, port)
+```
+
+**路径 2（external mode）：serve routesync 推送**
+
+external mode 的 node-proxy 通过 routesync 从 serve 拉取 `RouteEntry.AccessToken`（`node-ctl/proxy.go:146`），该值由 serve 在推送时填充。当前 serve 推送的是 `sb.EnvdAccessToken`；需同步修改推送侧，对 bare profile 改填 `sb.TrafficAccessToken`：
+
+```go
+// serve — routesync RouteEntry 构造处（bare profile 分支）
+entry.AccessToken = sb.EnvdAccessToken  // 当前
+// 改为：
+if sb.Profile() == types.ProfileBare {
+    entry.AccessToken = sb.TrafficAccessToken
+} else {
+    entry.AccessToken = sb.EnvdAccessToken
+}
+```
+
+`RouteEntry.AccessToken` 字段无需改名（已是通用字段名），只有填值逻辑需要按 profile 区分。
+
+同步修正 `proxy.go Route.AccessToken` 注释，删除误导性的 `e.g. bare` 说明：
+
+```go
+// AccessToken is the expected data-plane bearer token checked by AuthMiddleware.
+// Empty string disables per-route auth (only acceptable when auth mode is off or log).
+AccessToken string
+```
+
+**措施 B：禁止 bare profile + AuthOff 共存**
+
+在 serve 配置加载或启动校验阶段增加约束：
+
+```go
+if cfg.HasBareProfile() && cfg.Proxy.Auth == config.AuthOff {
+    return errors.New("proxy.auth=off is not permitted when bare-profile sandboxes are enabled; use log or enforce")
+}
+```
+
+或等效地：routesync hello 帧下推 auth 模式后，proxy 侧检查；若 `hello.policy.auth == off` 且存在 bare profile 路由则记 ERROR 告警并强制使用 log 模式，拒绝静默降级。
+
+#### P1：网络层缩小浮动 IP 可达面（中等成本，运维变更）
+
+在宿主机 default netns 增加 iptables `owner` 规则，将浮动 IP 段的出向连接权限锁定到 node-proxy/node-ctl 进程运行用户（如 `uid=node-ctl`）：
+
+```bash
+# 只允许 node-ctl 进程用户（uid=1001）建立到浮动 IP 段的连接
+iptables -I OUTPUT -d <floating-ip-cidr> \
+  -m owner ! --uid-owner node-ctl \
+  -j REJECT --reject-with icmp-admin-prohibited
+```
+
+此规则与 vswitch eBPF 的 sandbox 间隔离形成双重网络层防护：sandbox 间流量被 eBPF 结构性阻断，宿主机其他进程的直连流量被 iptables 阻断，proxy 成为唯一合法的浮动 IP 访问路径。
+
+实施注意：需在 vswitch attach/detach 流程中同步维护浮动 IP 集合（建议使用 ipset 动态管理）。
+
+#### P2：bare profile 端口 allowlist（中等成本，代码变更）
+
+在 sandbox 配置（`X-Kuasar-Sandbox-Launch`）中增加 `bare_allowed_ports` 字段，`Dispatcher` 对 bare profile 增加端口白名单过滤：
+
+```go
+if entry.Profile == types.ProfileBare && !entry.AllowedPorts.Contains(port) {
+    return ErrPortDenied  // 返回 403
+}
+```
+
+未在白名单声明的端口即使持有合法 token 也无法访问，token 泄露后的爆炸半径收缩到显式声明的端口集合。
+
+#### P3：轻量 auth sidecar（较高成本，新增组件）
+
+bare profile 缺少 in-guest 认证层是与 e2b profile 的结构性差距。可为 bare profile 提供可选的极简 init 进程（非完整 envd），职责单一：
+
+- 从 MMDS 或启动参数获取 `TrafficAccessToken`
+- 监听代理端口，校验 `X-Access-Token` header
+- 校验通过后 TCP 转发到 guest 内应用实际端口
+
+实现后，bare profile 获得与 e2b 对等的纵深防御：proxy 层 token 校验 + in-guest sidecar 校验，浮动 IP 直连不再裸露应用端口。
+
+### 7.5 风险与消减措施汇总
+
+| 风险 | 严重度 | 成立条件 | 消减措施 | 优先级 |
+|------|--------|---------|---------|--------|
+| 注释/实现分歧导致 bare token 被误清空 | 高（一次 PR 即可触发）| 开发者依注释"修复"代码 | P0-A：token 语义分离 + 注释修正 | **P0** |
+| `AuthOff` + bare profile 运维失误共存 | 高（认证完全关闭）| 配置错误 | P0-B：启动校验拒绝共存 | **P0** |
+| 宿主机进程绕过 proxy 直连浮动 IP | 高（bare 无 in-guest 兜底）| 宿主机网络未隔离 | P1 iptables owner 规则 | P1 |
+| token 泄露后多端口暴露 | 中（需先获取 token）| token 从 API 响应泄露 | P2 端口 allowlist | P2 |
+| bare profile 无纵深防御（结构性差距）| 中（需突破 proxy + 网络隔离）| 攻击者能直连浮动 IP | P3 轻量 auth sidecar | P3 |
+
+**vswitch 已覆盖（无需额外消减）**：sandbox 间 eBPF 结构性隔离（无 port→port 转发路径），跨 sandbox 直接攻击在数据面被静态阻断。
 
 ---
 
