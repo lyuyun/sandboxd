@@ -998,34 +998,37 @@ bare profile 通过 API 全流程产出基础镜像（`bare-img-<key>`，见 §3
 
 ---
 
-## 4.10 集群模式 bare img Phase A 构建完整流程
+## 4.10 bare img Phase A 构建完整流程
 
 ### 4.10.1 概述
 
-§4.2 描述的是 Client 直连单节点 node-ctl conductor 的构建路径。集群模式下，Client 连接的是
-**router**，router 通过 route-link 向 **registry** 发起 `ReserveBuild`，registry 通过
-**placer** 按 `build_capacity` 选节点、通过 **node-link** 下发 `CmdBuildRegister` 预配节点；
-后续 TriggerBuild / 状态查询由 router 直接转发到节点数据面（`DataEndpoint`），构建状态变更
-通过 node-link **build_event** 异步回报 registry（用于释放预扣资源）。
+本节描述 bare img Phase A 构建在两种部署模式下的完整流程。
 
-bare img Phase A 场景：`fromImage` 非空、无 `steps`、无 `startCmd`，构建仅执行 Phase A，
-Finale 只产出 `bare-img-<key>`，整个流程不涉及 Phase B / Phase C。
+**bare img Phase A 场景**：`fromImage` 非空、无 `steps`、无 `startCmd`，构建仅执行 Phase A，Finale 只产出 `bare-img-<key>`，整个流程不涉及 Phase B / Phase C。所需改动见 §4.9.5（单节点）和 §4.10.6（集群额外部分）。
 
-### 4.10.2 与单节点模式的对比
+**单节点模式**（§4.10.8）：Client 直连 node-ctl conductor，无路由层介入。RegisterBuild 直接写本地 builds 表，TriggerBuild 由本节点处理，BuildPool 调度构建，构建状态仅维护在本地 builds 表。适用于单机部署或开发环境。
 
-| 维度 | 单节点（§4.2） | 集群（§4.10） |
-|------|--------------|-------------|
-| 客户端入口 | 直连 node-ctl API | Router 层（透明转发到目标节点） |
+**集群模式**（§4.10.3）：Client 连接 **router**，router 通过 route-link 向 **registry** 发起 `ReserveBuild`，registry 通过 **placer** 按 `build_capacity` 选节点、通过 **node-link** 下发 `CmdBuildRegister` 预配节点；后续 TriggerBuild / 状态查询由 router 直接转发到节点数据面（`DataEndpoint`），构建状态变更通过 node-link **build_event** 异步回报 registry（用于释放预扣资源）。适用于多节点生产部署。
+
+两种模式在节点侧的核心路径（BuildPool → runBuildUnit → sandbox-builder → Phase A → Finale）完全相同，差异集中在请求路由、资源预扣和状态上行三个环节，详见 §4.10.10。
+
+### 4.10.2 集群模式与单节点模式的对比
+
+| 维度 | 单节点（§4.10.8） | 集群（§4.10.3） |
+|------|----------------|---------------|
+| 客户端入口 | Client 直连 node-ctl | Client → Router → Registry → Node |
 | 节点选择 | 固定（本机） | placer P2C 按 `build_capacity` 选节点，最多重试 2 次 |
-| RegisterBuild | 节点写 builds 表 | router → registry `ReserveBuild` → `CmdBuildRegister` → 节点写 builds 表 |
+| RegisterBuild | `newRegisteredBuild` 直接写本地 builds 表 | router → registry `ReserveBuild` → `CmdBuildRegister` → 节点写 builds 表 |
 | TriggerBuild | 节点直接处理 | router `forwardBuild` → 节点 DataEndpoint |
-| 状态查询 | 节点直接返回 | router `forwardBuild`；router 重启后 `ResolveBuild` 恢复路由 |
-| 状态回报 | 仅本地日志 | node-link `build_event` → registry（驱动 `admitBuild` 预扣释放） |
-| 资源预扣 | BuildPool 信号量（节点侧） | registry `admitBuild`（集群侧）+ 节点 BuildPool 信号量（双层） |
-| image-pull 凭证 | TriggerBuild 请求体明文或加密存储 | `CmdBuildRegister.RegistryAuth` → 节点内存暂存，terminal 时清除 |
+| 状态查询 | 节点直接返回 | router `forwardBuild` 转发 |
+| 状态回报 | 仅本地 builds 表，客户端直查 | `publishBuildState` → node-link `build_event` → registry（驱动预扣释放） |
+| 资源预扣 | BuildPool 信号量（节点侧） | registry `admitBuild` CAS（集群侧）+ 节点 BuildPool 信号量（双层） |
+| image-pull 凭证 | request body → `localBuildCreds` → `registryAuthEnc` 落盘 | `CmdBuildRegister.RegistryAuth` → `clusterBuildCreds` 内存暂存，terminal 时清除 |
 | profile 传递 | API 请求 → `newRegisteredBuild` 直接读 | API 请求 → router metadata → `BuildReserveReq.Metadata` → `CmdBuildRegister.Config` → `registerClusterBuild` 读取 |
+| 路由恢复 | 无需（直连） | router 重启后 `routeLinkResolveBuild` 向 registry 重建缓存 |
+| 所需改动 | §4.9.5 三处（profile/allocInnerIP/innerGateway） | §4.9.5 三处 + §4.10.6 额外三处（registerClusterBuild/handleBuildRegister/TriggerBuild） |
 
-### 4.10.3 完整调用链
+### 4.10.3 集群模式完整调用链
 
 ```
 Client
@@ -1036,12 +1039,12 @@ Client
 │   [Router handleBuildRegister]
 │       authorize(group by X-API-KEY)
 │       resources = parseResources(X-Kuasar-Sandbox-Resource / body.cpuCount/memoryMB)
-│       metadata = {"profile": "bare", ...}                ← profile 注入 Metadata
-│       buildID  = uuid.NewV7()
-│       templateID = "transient-" + uuid.NewV7()
+│       buildID    = "bld-" + randomHexID()
+│       templateID = "transient-" + randomHexID()
+│       metadata   = {"profile": "bare"}                   ← 需改动（见 §4.10.6）
 │
 │       POST /route-link/reserve-build
-│           {group, build_id, template_id, resources, metadata}
+│           {group, build_id, template_id, resources}       ← 当前不含 metadata；需改动（见 §4.10.6）
 │
 │       [Registry ReserveBuild]
 │           GetBuildInGroup(group, bid) → 已有则幂等返回
@@ -1117,7 +1120,7 @@ Client
 │
 │           runBuildUnit(b)
 │               mkdir <RunRoot>/<bid>/
-│               allocInnerIP(b.Profile, "")               ← 需改动（见 §4.10.6）
+│               allocInnerIP(b.Profile, "")               ← 需改动（见 §4.9.5）
 │               vs.Attach(port) → {MAC, FloatingIP, TapFDExec}
 │               keys.MintToken() → envdToken
 │               pend[bid] = pendingBuild{port, envdToken, group, ...}
@@ -1125,12 +1128,12 @@ Client
 │                      publishUpsert(build-<bid>)
 │               lc.Start("sandbox-builder@<bid>.service")  ← Type=oneshot，阻塞至退出
 │
-│   [run-builder (systemd ExecStart, cgroup 隔离)]
+│   [sandbox-builder@<bid>（systemd oneshot，cgroup 隔离）]
 │       configsock.FetchBuildSpec("build:<bid>")           ← UDS，SO_PEERCRED 鉴权
 │
 │           [Node BuildSpecFor(bid)]
 │               pend[bid] 读取
-│               innerGateway(b.Profile)                    ← 需改动（见 §4.10.6）
+│               innerGateway(b.Profile)                    ← 需改动（见 §4.9.5）
 │               Env: {MANIFEST_KEY: <64hex>, FLATTEN_REGISTRY_*: ...}
 │               Net: {InnerIP, InnerGateway, MAC, FloatingIP, TapFDExec}
 │               FromImage: "debian:bookworm-slim"
@@ -1234,7 +1237,7 @@ Client
        importYAML 配置，无 envd，无 Phase B/C 依赖
 ```
 
-### 4.10.4 时序图
+### 4.10.4 集群模式时序图
 
 ```mermaid
 sequenceDiagram
@@ -1303,7 +1306,7 @@ sequenceDiagram
     end
 ```
 
-### 4.10.5 关键设计要点
+### 4.10.5 集群模式关键设计要点
 
 #### 节点选择与资源预扣
 
@@ -1337,13 +1340,13 @@ router 内存 `builds[bid] = DataEndpoint` 是热路径缓存。router 重启后
 
 ```
 Client body {"profile":"bare"}
-  → Router: metadata["profile"] = "bare"
-  → BuildReserveReq.Metadata["profile"] = "bare"
+  → Router: metadata["profile"] = "bare"             ← 需改动（见 §4.10.6）
+  → BuildReserveReq.Metadata["profile"] = "bare"     ← 需改动（见 §4.10.6）；registry 已透传 Config: req.Metadata，无需改
   → CmdBuildRegister.Config["profile"] = "bare"
-  → registerClusterBuild: b.Profile = cmd.Config["profile"] ?? ProfileE2B
-  → TriggerBuild: b.Profile 已正确，bare 校验生效
-  → runBuildUnit: allocInnerIP(b.Profile)
-  → BuildSpecFor: innerGateway(b.Profile)
+  → registerClusterBuild: b.Profile = cmd.Config["profile"] ?? ProfileE2B  ← 需改动（见 §4.10.6）
+  → TriggerBuild: b.Profile 已正确，bare 校验生效   ← 需改动（见 §4.10.6）
+  → runBuildUnit: allocInnerIP(b.Profile)             ← 需改动（见 §4.9.5）
+  → BuildSpecFor: innerGateway(b.Profile)             ← 需改动（见 §4.9.5）
   → executeBuild: PersistID = "bare-img-<key>"
 ```
 
@@ -1368,8 +1371,8 @@ TriggerBuild 层面提前拒绝。
 | 位置 | 当前状态 | 需改为 |
 |------|---------|--------|
 | `orch/cluster.go` `registerClusterBuild` line 125 | `Profile: types.ProfileE2B` 硬编码 | `Profile: types.ProfileFromString(cmd.Config["profile"], types.ProfileE2B)` |
-| `internal/registry/build.go` `ReserveBuild` | `CmdBuildRegister` 不显式携带 profile，依赖 `Config` 透传 | 无需改结构，确认 `Config: req.Metadata` 已透传（当前代码已透传，无需改动） |
-| `internal/router/router.go` `handleBuildRegister` | metadata 组装时是否提取 body `profile` 字段 | 确认从请求 body 读取 `profile` 并注入 `BuildReserveReq.Metadata` |
+| `internal/registry/build.go` `ReserveBuild` | `CmdBuildRegister` 不显式携带 profile，依赖 `Config` 透传 | 无需改动：`Config: req.Metadata` 已透传（代码已实现） |
+| `internal/router/router.go` `handleBuildRegister` | body struct 无 `profile` 字段；`routeLinkReserveBuild` 不发 `metadata` | 在 body struct 增加 `Profile string \`json:"profile"\``；`routeLinkReserveBuild` 增加 `"metadata": {"profile": profile}` |
 | `orch/build.go` `TriggerBuild` | 未对 bare profile 拒绝 steps/startCmd | 在 `TriggerBuild` 校验段增加：`if b.Profile == ProfileBare && (len(steps)>0 || startCmd!="") { return 400 }` |
 
 单节点改动（§4.9.5）在集群模式下同样必须：
@@ -1379,9 +1382,9 @@ TriggerBuild 层面提前拒绝。
 | `orch/build.go` `runBuildUnit` `allocInnerIP` | `allocInnerIP(b.Profile, "")` |
 | `orch/build.go` `BuildSpecFor` `innerGateway` | `innerGateway(b.Profile)` |
 
-上述改动合计 5 处，`registerClusterBuild` 改动是集群模式独有的，其余 3 处与单节点共享。
+上述改动合计 6 处（`registry/build.go` 无需改动）。`registerClusterBuild` 和 `handleBuildRegister` 是集群模式独有的改动，其余 4 处与单节点共享。
 
-### 4.10.7 故障场景补充（集群特有）
+### 4.10.7 集群模式故障场景
 
 | 故障场景 | 系统行为 | 恢复手段 |
 |---------|---------|---------|
@@ -1390,6 +1393,331 @@ TriggerBuild 层面提前拒绝。
 | router 重启（builds 缓存丢失） | 首次 forwardBuild miss → `routeLinkResolveBuild` 查 registry → 重建缓存 | 自动恢复，对客户端透明 |
 | node 构建中下线（node-link 断开） | registry `applyBuildEvent` 不再收到 terminal 事件，`NodeBuildAlloc` 预扣不自动释放；node 重连后 BuildPool 扫到 `building` 状态不自动重试 | 运维手动将 builds 表状态重置为 `waiting`；`NodeBuildAlloc` 在 `sweepNode` 死节点清理时随 `NodeRecord` 一起清除 |
 | manifest store 不可达（Finale 失败） | run-builder stdout 写 `{"error":"..."}`, `lc.Start` 返回后 `runBuildUnit` 读到 error，`publishBuildState("error")` → node-link → registry 释放预扣 | 网络恢复后重新 TriggerBuild（需运维将状态从 error 重置为 waiting，或重新 RegisterBuild） |
+
+### 4.10.8 单节点模式完整调用链
+
+单节点模式下 Client 直连 node-ctl conductor，无 Router / Registry / Placer 介入，无跨节点资源预扣，无 build_event 上行。相比集群模式（§4.10.3），调用链缩短为三步：RegisterBuild → TriggerBuild → 轮询状态。
+
+```
+Client
+│
+├─ POST /v3/templates
+│   {profile: "bare", cpuCount, memoryMB, name}        ← X-API-KEY
+│
+│   [node-ctl conductor handleRegisterBuild]
+│       authorize(group by X-API-KEY → manifestKey)
+│       buildID    = uuid.NewV7()
+│       templateID = "transient-" + uuid.NewV7()
+│       newRegisteredBuild:
+│           b.Profile     = req.Profile ("bare")        ← 需改动（见 §4.9.5）
+│           b.Kind        = KindImg
+│           b.ManifestKey = manifestKey                 ← 由 X-API-KEY 派生
+│           PutBuild({BuildID, TemplateID,
+│                     Profile:"bare", Kind:img,
+│                     Status:registered, ManifestKey,
+│                     CreatedUnix:now})
+│   ← 202 {templateID:"transient-<uuid>", buildID:"<uuid>"}
+│
+├─ POST /v2/templates/{tid}/builds/{bid}
+│   {fromImage: "debian:bookworm-slim"}                 ← X-API-KEY，无 steps/startCmd
+│
+│   [node-ctl conductor TriggerBuild]
+│       ownsBuild(bid, manifestKey derived from X-API-KEY)
+│       bare profile 校验：steps 非空 → 400；startCmd 非空 → 400   ← 需改动（见 §4.9.5）
+│       fromImage 非空 / fromTemplate 互斥检查
+│       resolveBuildCreds:
+│           localBuildCreds(bid) → registryAuth from request body（不经 clusterBuildCreds）
+│       PutBuild(status:waiting, kind:img,
+│               fromImage:"debian:bookworm-slim",
+│               registryAuthEnc:AES-256(registryAuth))
+│   ← 200 {}
+│
+│   [BuildPool ticker 5s]
+│       BuildsByStatus(waiting) → [bid, ...]
+│       sem <- struct{}{}                              ← 获取信号量（max_concurrent）
+│       CASBuildStatus(bid, waiting → building)
+│       go executeBuild(b):
+│
+│           runBuildUnit(b)
+│               mkdir <RunRoot>/<bid>/
+│               allocInnerIP(b.Profile, "")            ← 需改动（见 §4.9.5）
+│               vs.Attach(port) → {MAC, FloatingIP, TapFDExec}
+│               keys.MintToken() → envdToken
+│               pend[bid] = pendingBuild{port, envdToken, ...}
+│               [MMDS] publishUpsert(build-<bid>, FloatingIP)
+│               lc.Start("sandbox-builder@<bid>.service")  ← 阻塞至单元退出
+│
+│   [sandbox-builder@<bid>（systemd oneshot，cgroup 隔离）]
+│       configsock.FetchBuildSpec("build:<bid>")        ← UDS，SO_PEERCRED 鉴权
+│
+│           [node-ctl BuildSpecFor(bid)]
+│               pend[bid] 读取
+│               innerGateway(b.Profile)                 ← 需改动（见 §4.9.5）
+│               Env: {MANIFEST_KEY:<64hex>,
+│                     FLATTEN_REGISTRY_HOST:<host>,
+│                     FLATTEN_REGISTRY_AUTH:<creds>}
+│               Net: {InnerIP, InnerGateway, MAC, FloatingIP, TapFDExec}
+│               FromImage:    "debian:bookworm-slim"
+│               Steps:        []      （bare Phase A 无 steps）
+│               StartCmd:     ""      （bare 无 startCmd）
+│               FromTemplate: ""      （纯 fromImage）
+│           ← BuildSpec
+│
+│       builder.Run(spec)
+│           resolveBase:
+│               spec.FromTemplate="" → 跳过
+│               baseRef = "debian:bookworm-slim"
+│
+│           Phase A（phaseImport）：
+│               importYAML():
+│                   base: cfg.Builder.RuntimeBuilder（builder-runtime rootfs）
+│                   disk: 空盘
+│                   launch.placeholder = true
+│               startSandbox("a", importYAML, no envdUDS)
+│               waitExecReady(60s):
+│                   poll "flatten-ctl mountpoint /.probe"（300ms 间隔，10s 超时）
+│               sb.exec(tenantEnv,
+│                       "flatten-ctl export --output - debian:bookworm-slim")
+│                   sandbox-ctl exec
+│                       --env FLATTEN_REGISTRY_AUTH=<creds>
+│                       --stdout-to <workdir>/image.img
+│                       -- flatten-ctl export --output - debian:bookworm-slim
+│                   [guest 内]：OCI pull → flatten → EROFS stream → image.img
+│               sb.teardown(): SIGTERM → 20s → SIGKILL
+│
+│           Phase B: steps=[] → 跳过
+│           Phase C: startCmd="" → 跳过
+│
+│           Finale:
+│               bundle="" → 跳过 uploadSnapshot
+│               imagePath = workdir/image.img →
+│                   uploadImage:
+│                       manifest-ctl store --no-progress \
+│                           --manifest-config <manifest-config> \
+│                           workdir/image.img
+│                       → ImageKey（64-hex）
+│               return BuildResult{ImageKey}
+│           写 stdout: {"image_key":"<ImageKey>"}
+│
+│   [runBuildUnit：lc.Start 返回]
+│       read <RunRoot>/<bid>/<bid>.result → {image_key:"<ImageKey>"}
+│       lc.Stop("sandbox-builder@<bid>")
+│       lc.ResetFailed("sandbox-builder@<bid>")
+│       vs.Detach(port)
+│       uncache + publishDelete(build-<bid>)
+│       delete pend[bid]
+│       os.RemoveAll(<RunRoot>/<bid>/)
+│
+│       PersistID = types.TemplateID{
+│           Profile: "bare",
+│           Kind:    KindImg,
+│           Key:     <ImageKey>,
+│       }.String()  =  "bare-img-<ImageKey>"
+│
+│       PutBuild(status:ready, PersistID:"bare-img-<ImageKey>")
+│       <- sem                                          ← 释放 BuildPool 信号量
+│
+├─ GET /templates/{tid}/builds/{bid}/status  （客户端轮询）
+│   [node-ctl conductor GetBuildStatus]
+│       GetBuild(bid) → {status:"ready", templateID:"bare-img-<ImageKey>"}
+│   ← {status:"ready", templateID:"bare-img-<ImageKey>"}
+│
+└─ POST /sandboxes {"templateID":"bare-img-<ImageKey>"}
+       CreateSandbox → 冷启动 bare sandbox（无 envd，无 Phase B/C 依赖）
+```
+
+### 4.10.9 单节点模式时序图
+
+```mermaid
+sequenceDiagram
+    participant C  as Client
+    participant N  as node-ctl conductor
+    participant SB as sandbox-builder@bid
+    participant MS as manifest store
+
+    C->>N:  POST /v3/templates {profile:"bare"} X-API-KEY
+    N->>N:  authorize → manifestKey<br/>newRegisteredBuild(profile=bare, kind=img)<br/>PutBuild(status=registered)
+    N-->>C: 202 {templateID:"transient-<uuid>", buildID}
+
+    C->>N:  POST /v2/templates/{tid}/builds/{bid}<br/>{fromImage:"debian:bookworm-slim"}
+    N->>N:  TriggerBuild:<br/>bare profile 拒绝 steps/startCmd<br/>localBuildCreds → registryAuth<br/>PutBuild(status=waiting, kind=img)
+    N-->>C: 200
+
+    Note over N: BuildPool tick 5s
+    N->>N:  CASBuildStatus(waiting→building)
+    N->>N:  allocInnerIP(ProfileBare) + vs.Attach → port<br/>pend[bid]={port, envdToken, ...}<br/>MMDS publishUpsert(build-bid)
+    N->>SB: lc.Start(sandbox-builder@bid.service)
+
+    SB->>N:  configsock FetchBuildSpec("build:bid")
+    N->>N:   BuildSpecFor(bid):<br/>fromImage, env(MANIFEST_KEY/FLATTEN_*),<br/>innerGateway(bare)
+    N-->>SB: BuildSpec
+
+    Note over SB: Phase A
+    SB->>SB: startSandbox("a", importYAML)<br/>waitExecReady(60s)
+    SB->>SB: exec flatten-ctl export debian:bookworm-slim<br/>→ image.img
+
+    Note over SB: Finale (img only)
+    SB->>MS: manifest-ctl store image.img
+    MS-->>SB: ImageKey (64-hex)
+    SB->>SB: write stdout {"image_key":"<ImageKey>"}
+
+    SB-->>N: lc.Start returns（单元退出）
+    N->>N:  read result → bare-img-<ImageKey><br/>lc.Stop/ResetFailed<br/>vs.Detach + cleanup workdir<br/>PutBuild(status=ready, PersistID=bare-img-<ImageKey>)<br/><-sem
+
+    loop 轮询
+        C->>N:  GET /templates/{tid}/builds/{bid}/status
+        N-->>C: {status:"ready", templateID:"bare-img-<ImageKey>"}
+    end
+```
+
+### 4.10.10 单节点与集群模式关键差异对比
+
+| 维度 | 单节点（§4.10.8） | 集群（§4.10.3） |
+|------|-----------------|----------------|
+| 入口 | Client 直连 node-ctl | Client → Router → Registry → Node |
+| 节点选择 | 固定（本机） | placer P2C 按 `build_capacity` |
+| 资源预扣 | BuildPool 信号量（节点侧） | registry `admitBuild` CAS + BuildPool 信号量（双层） |
+| RegisterBuild | `newRegisteredBuild` 直接写本地 builds 表 | router → `ReserveBuild` → `CmdBuildRegister` → 节点写 builds 表 |
+| Registry Auth | request body → `localBuildCreds` → `registryAuthEnc` 落盘 | `CmdBuildRegister.RegistryAuth` → `clusterBuildCreds` 内存暂存，terminal 时清除 |
+| 状态上行 | 仅本地 builds 表，客户端直查 | `publishBuildState` → node-link `build_event` → registry（驱动预扣释放） |
+| 路由恢复 | 无需（直连） | router 重启后 `routeLinkResolveBuild` 向 registry 重建缓存 |
+| 所需改动 | §4.9.5 三处（profile/allocInnerIP/innerGateway） | §4.9.5 三处 + §4.10.6 额外三处（registerClusterBuild/handleBuildRegister/TriggerBuild） |
+
+---
+
+## 4.11 集群模式 bare img Phase A 更新构建
+
+### 4.11.1 场景描述
+
+bare img 调用方持有 `bare-img-<key1>` 的 TTL（月级别）。TTL 届满时，调用方须重新触发构建以刷新持有的 key。构建请求到达时，系统面临两种不同的底层状态：
+
+- **Case 1**：manifest store **generation 未变**（active gen 仍是 G1）
+- **Case 2**：manifest store **generation 已变**（G1 → G2 rollout，serve 已重启）
+
+两种状态决定了重建的代价差异。
+
+### 4.11.2 背景：manifest store generation 模型
+
+generation 是 **store 级别的全局概念**，不是 per-template 或 per-tenant 的独立管理单元。整个 store 共享一个 `__meta/generations` 文件，`store-ctl rollout` 一次性把所有 partition 的 active generation 切换。
+
+| 特性 | 说明 |
+|------|------|
+| **作用域** | Store 全局；单次 rollout 影响 store 内所有 template 的所有 chunk |
+| `Exists` 语义 | 只查 active generation；旧代 chunk 在新代 `Exists = false` |
+| `Get` 语义 | 反向扫描（newest-first）；旧代数据在 purge 前仍可读 |
+| generation 变更触发 | 仅 `store-ctl rollout` 手动执行，月级别频率 |
+| salt 与 generation 绑定 | `salt = SHA256("accelerator-salt-v1" \|\| generationID)`；generation 不变则 salt 不变 |
+| 收敛加密推论 | 同 plaintext + 同 salt → 同 ciphertext → 同 ContentKey；generation 变化则 store 内所有 key 全变 |
+| 细粒度隔离 | `ExtraSaltFunc` 在 generation base salt 之上叠加 per-tenant / per-image 额外 salt，把 dedup 域收窄；与 generation 正交 |
+
+**store-wide generation 的设计收益**：
+
+- **跨 template 去重**：同代内所有 template 共享 dedup 域，底层 OCI base layer 相同的 chunk 只存一份；若 generation 是 per-template，同内容因 salt 不同产出不同 key，跨 template dedup 失效。
+- **GC 语义清晰**：`purge --generation G1` 一条命令原子删除整代所有数据，无需引用计数或 per-object 追踪，旧代生命周期与 template 生命周期解耦。
+- **加密轮换原子性**：rollout 后所有新写入立即使用新 salt，无需协调各 template 分别切换，等价于一次全量密钥轮换。
+- **运维简单**：只有一条 `store-ctl rollout` 命令，无需感知 template 数量和状态。
+
+**代价**：generation rollout 是全量事件——store 内所有 template 的 chunk 在新代 `Exists = false`，需全部重新写入，不能只针对某个 template 单独刷新。
+
+### 4.11.3 两条更新路径
+
+**Path 1：fromImage 重建**（现有实现，§4.2 Phase A）
+
+```
+OCI registry pull（外网）
+  → flatten-ctl export（mkfs.erofs，CPU 密集）
+  → manifest-ctl store（chunk + encrypt + Put × N）
+  → bare-img-<key>
+```
+
+**Path 2：manifest re-encrypt**（待实现）
+
+```
+manifest-ctl load key1（内网，读 G1 manifest）
+  → 对每个 chunk：Get(G1_key) → DecryptInPlace(G1_salt) → re-encrypt(G2_salt) → Put
+  → 写新 manifest → bare-img-<key2>
+```
+
+### 4.11.4 Case 1：generation 未变（active = G1）
+
+`salt` 不变 → 同 plaintext 产出同 ciphertext → 同 ContentKey。
+
+#### Path 1（fromImage）
+
+| 子路径 | 步骤 | 耗时 |
+|--------|------|------|
+| 有 `--with-referer` | OCI Referrers API 命中 → owner + `valid_at` 匹配 → **直接返回 key1**，不拉层不展平不上传 | < 1 s（一次 Referrers round-trip） |
+| 无 `--with-referer` | OCI pull（层可能已 local cache）→ mkfs.erofs → ingest：`Exists(G1_key)` 全命中 → **100% dedup，StoredChunks ≈ 0**；但 mkfs.erofs 为不可省固定成本 | 10–60 s |
+
+#### Path 2（re-encrypt）
+
+generation 未变 → salt 未变 → re-encrypt 产出同 key1 → **本质 no-op**。
+
+实现：读 manifest(key1) → 遍历 chunk list → `Exists(G1_key)` 全命中 → 产出相同 key1 → 直接返回。
+
+耗时：< 100 ms（N 次 Exists check，无数据传输）。
+
+#### Case 1 小结
+
+| 方案 | 耗时 | 备注 |
+|------|------|------|
+| Path 1 + `--with-referer` | < 1 s | 依赖 OCI Referrers API 及 push 权限 |
+| Path 1（无 referer） | 10–60 s | mkfs.erofs 是固定成本，全 dedup 也无法省略 |
+| Path 2（re-encrypt） | < 100 ms | 实现最简；无外部依赖；generation 未变时天然 no-op |
+
+### 4.11.5 Case 2：generation 已变（G1 → G2）
+
+`Exists` 只查 G2；所有 G1 chunk 在 G2 `Exists = false`；`Get` reverse scan G1 仍可读直到 purge。
+
+#### Path 1（fromImage）
+
+| 子路径 | 步骤 | 代价 |
+|--------|------|------|
+| 有 `--with-referer` | Referrers 命中 key1（G1 key）→ `valid_at` 未过期则**直接返回 key1**，不检查是否在 active G2 | 语义存疑：返回的是 G1 key，功能上暂时可用，但 G1 purge 后失效 ⚠️ |
+| 无 `--with-referer` | OCI pull（外网）→ mkfs.erofs → G2 ingest：`Exists(G2_key)` 全 miss，**0% dedup，所有 chunk 重新上传** | 30–210 s（G2 下最差情形） |
+
+`--with-referer` 存在代沟问题：referrer 记录的是 G1 key，generation 换代后 `valid_at` 可能仍在有效期内，系统无感知地返回旧代 key，直到 G1 被 purge 才暴露问题。
+
+#### Path 2（re-encrypt）
+
+```
+Get manifest(key1)       # G1 manifest，reverse scan 可读
+  for chunk_i in chunks:
+    Get(G1_key_i)        # G1 ciphertext，reverse scan 可读
+    DecryptInPlace(G1_salt)
+    re-encrypt(G2_salt)  # 产出 G2 ciphertext
+    Put(G2_key_i)        # Exists(G2_key_i) = false → 全量写入
+write manifest(key2)     # G2 manifest key
+```
+
+| 维度 | 值 |
+|------|----|
+| dedup 率 | **0%**（G2 下全量新写，与 Path 1 相同） |
+| 省去的步骤 | OCI registry pull（外网 I/O）+ mkfs.erofs（CPU 重建） |
+| 耗时 | **2–8 s**（Get + decrypt/re-encrypt + Put 可并发流水线） |
+| 风险 | `Get(G1_key_i)` 依赖 G1 未 purge；若 purge 与 re-encrypt 并发则 mid-flight Get 失败 |
+
+#### Case 2 小结
+
+| 方案 | dedup | 耗时 | 备注 |
+|------|-------|------|------|
+| Path 1 + `--with-referer` | — | < 1 s | 返回 G1 key，generation 感知错误 ⚠️ |
+| Path 1（无 referer） | 0% | 30–210 s | 最差情形 |
+| Path 2（re-encrypt） | 0% | 2–8 s | 10×–50× 优于 Path 1；依赖 G1 未 purge |
+
+### 4.11.6 综合对比
+
+| | Case 1（G 未变） | Case 2（G 已变） |
+|---|---|---|
+| **Path 1 + `--with-referer`** | 近 0 代价，返回 key1 ✓ | 返回旧代 G1 key，语义存疑 ⚠️ |
+| **Path 1 无 referer** | mkfs.erofs 固定成本，10–60 s ✗ | OCI pull + mkfs.erofs，30–210 s ✗✗ |
+| **Path 2（re-encrypt）** | no-op，< 100 ms ✓✓ | 省 pull/flatten，2–8 s ✓；依赖 G1 未 purge |
+
+### 4.11.7 设计建议
+
+1. **短期**：继续使用 Path 1 + `--with-referer`。在 generation 未变（Case 1）的主路径下，referer 命中率高，代价接近 0。
+2. **generation 感知**：`--with-referer` 当前只校验 `owner` + `valid_at`，不感知 generation。由于 generation 是 store 全局的，一次 rollout 会使 store 内**所有** template 的 referrer key 同时失效——而 `valid_at` 仍在有效期内，导致批量返回旧代 key。修复方式：拿到 referrer key 后，对 manifest partition 调用 `Exists(key)`；若返回 false（key 不在 active generation），视为 stale，回退到完整重建流程，并在重建完成后以新 key 覆写 referrer。
+3. **中期**：实现 Path 2（`manifest-ctl transcode` 或等价命令），在 generation rollout 后提供 10×–50× 的更新加速。实现时需对 purge race 做防护：先确认 G1 仍为 non-active（未 purge），再开始 re-encrypt；或在 rollout 后设置一个宽裕的 re-encrypt 窗口，在此窗口内禁止 `purge G1`。
 
 ---
 
@@ -1406,9 +1734,27 @@ TriggerBuild 层面提前拒绝。
 | Phase C（template） | sandbox 冷启动 + startCmd 执行 + readyCmd 探针 | 5–60s |
 | Finale（upload） | manifest store 上传（受镜像大小和存储带宽影响） | 5–60s |
 
-并发控制：`builder.max_concurrent` 限制同时占用 vswitch slot 的构建数，防止单节点因并发构建导致网络资源耗尽（每个构建占用 1 个 vswitch port）。
+并发控制：`builder.max_concurrent` 限制同时占用 vswitch slot 的构建数，防止单节点因并发构建导致网络资源耗尽（每个构建占用 1 个 vswitch port）。Phase A/B 中 `flatten-ctl` 在 guest 内运行，OCI pull 流量经租户网络 vswitch，对宿主机网络无直接影响，但会占用 vswitch 带宽配额。
 
-Phase A/B 中 `flatten-ctl` 在 guest 内运行，拉镜像流量经过租户网络 vswitch，对宿主机网络无直接影响，但会占用 vswitch 带宽配额。
+### bare img Phase A 更新构建（TTL 刷新）
+
+调用方 TTL 届满触发更新构建时，性能由 **generation 是否变化** 和 **更新路径** 共同决定（详见 §4.11）。Generation 是 store 全局概念，一次 rollout 使 store 内所有 template 同时进入 Case 2。
+
+**Case 1：generation 未变（主路径，月内常态）**
+
+| 路径 | 步骤 | 典型耗时 |
+|------|------|---------|
+| Path 1 + `--with-referer` | Referrers API 命中 → 直接返回 key1，不拉层不展平 | < 1 s |
+| Path 1（无 referer） | OCI pull（层可能已 cache）→ mkfs.erofs → ingest（100% dedup） | 10–60 s |
+| Path 2（re-encrypt，待实现） | Exists 全命中 → no-op，直接确认 key1 | < 100 ms |
+
+**Case 2：generation 已变（rollout 后首次刷新，全量重写）**
+
+| 路径 | 步骤 | 典型耗时 | 备注 |
+|------|------|---------|------|
+| Path 1 + `--with-referer` | Referrers 命中旧代 key，`Exists` = false → 应回退重建 | — | 当前实现不做 `Exists` 校验，直接返回旧代 key ⚠️ |
+| Path 1（无 referer） | OCI pull + mkfs.erofs + G2 ingest（0% dedup） | 30–210 s | Generation 变化后最差情形 |
+| Path 2（re-encrypt，待实现） | G1 Get + decrypt + G2 re-encrypt + Put（0% dedup，可并发） | 2–8 s | 省去 OCI pull 和 mkfs.erofs，10×–50× 提速 |
 
 ---
 
