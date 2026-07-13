@@ -134,7 +134,7 @@
 
 ### 3.2 架构影响分析
 
-conductor 是节点数据面和控制面的枢纽，架构影响涵盖以下元素（详细交互见 §4.2 / §4.4 时序图）：
+conductor 是节点数据面和控制面的枢纽，架构影响涵盖以下元素（详细交互见 §4.2.1 / §4.2.2 / §4.4 时序图）：
 
 **新增组件**：无（利用现有 sandbox-runtime、sandbox-vswitch、sandbox-accelerator）
 
@@ -149,20 +149,24 @@ conductor 是节点数据面和控制面的枢纽，架构影响涵盖以下元�
 #### 沙箱状态机
 
 ```
-              Create
-    ∅ ──────────────────────► running ◄─────────────────────────────┐
-                                │   │                               │
-              Pause API /       │   │ Kill                          │
-              Reaper running    │   │ (st.Delete)                   │
-              TTL 到期          │   ▼                               │
-                                │   ∅（记录删除）                   │
-                                │                        Connect /  │
-                                ▼                        数据平面   │
-                              paused ────────────────────────────────┘
-                                │
-                                │ Kill（st.Delete）
-                                ▼
-                                ∅（记录删除）
+    Create(kind=img)          Create(kind=snp)
+    冷启动（OS boot）          快照恢复（CH restore）
+           │                        │
+           └──────────┬─────────────┘
+                      ▼
+    ∅ ────────────► running ◄──────────────────────────────────────┐
+                      │   │                                         │
+    Pause API /       │   │ Kill                                    │
+    Reaper TTL 到期   │   │ (st.Delete)                            │
+                      │   ▼                                         │
+                      │   ∅（记录删除）                             │
+                      │                   Connect / exec（paused）/ │
+                      ▼                   数据面流量（park/wake）   │
+                    paused ───────────────────────────────────────── ┘
+                      │
+                      │ Kill（st.Delete）
+                      ▼
+                      ∅（记录删除）
 
     running ──Reconcile（unit 消失）──► dead
 
@@ -175,11 +179,13 @@ conductor 是节点数据面和控制面的枢纽，架构影响涵盖以下元�
 
 | 状态 | 触发 | 持久化 |
 |------|------|--------|
-| running | Create / resume | state=running |
-| paused | Pause API / Reaper TTL | state=paused + snapshot_ref |
+| running | Create(kind=img 冷启动) / Create(kind=snp 快照恢复) / resume | state=running |
+| paused | Pause API / Reaper TTL 到期 | state=paused + snapshot_ref |
 | dead | Reconcile（unit 消失） | state=dead（仅 Reconcile 写入，不自动清理） |
 | ∅ | Kill（st.Delete） | 记录删除 |
 | SAVED（仅 registry） | deep-idle 到期，节点 promoteToSaved | 节点记录删除；registry SandboxRecord{SAVED, token} |
+
+**exec 与状态机的关系**：exec 本身不改变沙箱状态；对 paused 沙箱调用时，先触发与 `/connect` 相同的 `sf.Do(resumeIfPaused)` 路径（paused → running），再执行命令。exec 不延长 TTL。
 
 #### 静态规格
 
@@ -209,12 +215,19 @@ conductor 是节点数据面和控制面的枢纽，架构影响涵盖以下元�
 POST /sandboxes/{id}/exec
   │
   ▼ orch.Exec
-  1. st.Get(id) → sb；ownsSandbox 验证
+  1. st.Get(id) → sb；若 sb == nil → 404；ownsSandbox 验证
   2. 若 sb.State == dead → 404
-  3. 若 sb.State == paused → resumeIfPaused（同 /connect 单飞路径）
-  4. exec sandbox-ctl exec（timeout = min(req.TimeoutMs 或 30_000, 300_000) ms）
-       └── sandbox-ctl 连接 envd UDS，fork/exec 命令，收集 stdout/stderr，返回退出码
-  5. 返回 ExecResult
+  3. 若 sb.State == paused → sf.Do(sid, resumeIfPaused)（同 /connect 单飞路径）
+  4. 计算 deadline = now + min(req.TimeoutMs 或 30_000, 300_000) ms
+  5. fork sandbox-ctl exec --sid --cmd --env --cwd --timeout-ms
+       └── sandbox-ctl exec → ctl.sock → sandbox-ctl run → vsock → sandbox-init
+           sandbox-init setns(mnt+pid) 后 forkExecChild，stdout/stderr 经 MUX 透传
+  6. node-ctl 累积 stdout + stderr；超过 10 MiB 时停止读取，标记 truncated=true
+  7. 等待子进程退出，或 deadline 到期
+       a. 正常退出 → exit_code=N
+       b. deadline 到期 → node-ctl SIGKILL sandbox-ctl exec → exit_code=-1
+       c. ctl.sock / vsock 连接失败 → 500
+  8. 返回 ExecResult{Stdout, Stderr, ExitCode, DurationMs, Truncated}
 ```
 
 **请求体**
@@ -235,7 +248,8 @@ POST /sandboxes/{id}/exec
   "stdout":      "hello\n",
   "stderr":      "",
   "exit_code":   0,
-  "duration_ms": 42
+  "duration_ms": 42,
+  "truncated":   false
 }
 ```
 
@@ -246,16 +260,16 @@ POST /sandboxes/{id}/exec
 | 默认超时 | 30 s |
 | 最大超时 | 300 s |
 | stdout + stderr 合计上限 | 10 MiB；超出截断，响应附 `"truncated": true` |
-| 并发 exec 数（per sandbox）| 无硬上限；受 envd 侧限制 |
+| 并发 exec 数（per sandbox）| 无硬上限；受 sandbox-init 侧限制 |
 
-**超时处理**：`timeout_ms` 到期时 envd 向子进程发 SIGKILL，返回 `exit_code: -1`，响应码仍为 `200`（exec 本身成功，命令超时属业务语义）。
+**超时处理**：`timeout_ms` 到期时 node-ctl 向 sandbox-ctl exec 子进程发 SIGKILL，返回 `exit_code: -1`，响应码仍为 `200`（exec 本身成功，命令超时属业务语义）；沙箱在恢复阶段超时返回 `503`；sandbox-ctl exec 内部错误（ctl.sock / vsock 连接失败）返回 `500`。
 
 **状态语义**
 
 | 沙箱状态 | 行为 |
 |---------|------|
-| running | 直接执行 |
-| paused  | 先自动恢复（同 /connect），再执行 |
+| running | 直接 fork sandbox-ctl exec |
+| paused  | sf.Do(resumeIfPaused) 恢复为 running 后执行；exec 不延长 TTL |
 | dead    | 404 |
 
 ### 3.4 风险及设计约束
@@ -314,6 +328,29 @@ type Orchestrator struct {
 
 ### 4.2 沙箱 Create 流程
 
+**User Story → 详细设计节对照**：
+
+| Story | 标题 | 详细设计节 |
+|-------|------|-----------|
+| 1 | 基于展平镜像冷启动 | §4.2.1 |
+| 2 | 基于内存快照启动 | §4.2.2 |
+| 3 | 沙箱暂停和唤醒 | §4.3 + §4.4 |
+| 4 | 超时自动挂起 + 深度休眠 | §4.5 + §4.7 |
+| 5 | 跨节点迁移 | §4.9 |
+| 6 | 在沙箱中执行命令 | §4.8 |
+| — | 启动恢复（系统行为） | §4.6 |
+
+两条路径共用外层编排逻辑（认证、Token、vswitch Attach、store 写入、systemd 启动），在 `sandbox-ctl run` 内部分叉：
+
+| 维度 | §4.2.1 冷启动（kind=img）| §4.2.2 快照恢复（kind=snp）|
+|------|------|------|
+| sandbox-ctl 参数 | 无 `--restore` | `--restore manifest://<key>` |
+| uffd 内存源 | `ZeroSource`（填零，kernel 按需分配）| `StreamSnapshotSource`（读快照页）|
+| 启动行为 | kernel boot → overlay mount → envd init | CH `--restore` → uffd 按需加载 → restore notify |
+| 典型就绪时间 | 10–60 s | 1–3 s |
+
+**共同编排步骤**（两条路径均执行）：
+
 ```
 POST /sandboxes
   │
@@ -326,7 +363,7 @@ POST /sandboxes
   6. 构建 sb；仅 e2b profile 设置 EnvdUDS / CiUDS（bare profile 无 envd，字段保持空）
   7. launch(ctx, sb, tmpl)
      a. MkdirAll(RunDir, BaseDir)
-     b. snapshotConfig（若 kind=snp：读快照 capacity + network）
+     b. snapshotConfig（kind=snp 时：读快照 capacity + network）← kind=snp 独有
      c. allocInnerIP(profile, override)
      d. vs.Attach(AttachReq{innerIP, transit...}) → Port{floatingIP, MAC, port}
      e. sandboxParams → Params
@@ -334,6 +371,7 @@ POST /sandboxes
      g. st.Put(sb)                 ← 写 store（state=running）
      h. cache(sb)                  ← 写内存热缓存
      i. lc.Start(runnerUnit(sid))  ← 启动 sandbox-runner@<sid>.service
+        └── 路径在此分叉：§4.2.1（kind=img）或 §4.2.2（kind=snp）
      j. waitReady（poll envd /health，timeout 60s）    ← 仅 e2b profile
      k. envdInit（POST /init：env vars + accessToken if MMDS）← 仅 e2b profile
   8. publishUpsert(sb)  ← 通知 proxy
@@ -341,6 +379,10 @@ POST /sandboxes
 ```
 
 **LaunchSpec 流程**（config-socket task 平面）：`sandbox-runner@<sid>.service` 在 systemd 单元中执行 `node-ctl run-sandbox`，后者通过 config-socket 拉取 LaunchSpec，exec-replace 为 `sandbox-ctl run --sandbox-id <sid> --config <yaml> --restore <ref>（如有）`。manifest_key 通过 `LaunchSpec.Env["MANIFEST_KEY"]` 注入，不落磁盘。
+
+#### 4.2.1 冷启动（kind=img · Story 1）
+
+sandbox-ctl run 不携带 `--restore`，uffd handler 使用 `ZeroSource` 填零；CH 启动后 kernel 从零开始引导，sandbox-init 在 guest 内完成 overlay 组装、网络配置和用户进程启动。
 
 ```mermaid
 sequenceDiagram
@@ -356,7 +398,7 @@ sequenceDiagram
     participant E as envd(guest)
     participant P as proxy
 
-    C->>O: POST /sandboxes
+    C->>O: POST /sandboxes（kind=img）
     O->>O: resolveAllowed / ParseTemplateID / MintToken×2
     O->>VS: Attach(innerIP) connector-ctl vswitch attach
     VS-->>O: Port{floatingIP,MAC} stdout JSON
@@ -374,35 +416,28 @@ sequenceDiagram
     SC->>SC: cgroup.AddPID(ch.pid)（CH 加入 per-sandbox cgroup）
     CH->>SC: connect(uffd.sock)（patched create_ram_region 同步 dial）
     CH->>SC: va_report{va_start, size} + SCM_RIGHTS(uffd fd)
-    SC->>SC: AddrMap.RegisterVMA → OnReady → 启动 uffd handler goroutine
+    SC->>SC: AddrMap.RegisterVMA → OnReady → 启动 uffd handler goroutine（ZeroSource）
     SC-->>CH: ack
-    Note over SC: uffd handler 就绪，缺页时按需填充<br>（kind=img: ZeroSource 填零；kind=snp: StreamSnapshotSource 读快照页）
-    alt kind=img（冷启动）
-        Note over CH,SI: kernel 启动 → sandbox-init PID 1 启动
-        SI->>SI: bind vsock :5000（反向通道监听，必须在 hello 前）
-        par 握手与 overlay 组装并发
-            SI->>SC: connect(vsock port 5000)
-            SI->>SC: TypeHello{phase:"ready"}
-            SC-->>SI: TypeLaunch(LaunchSpec)
-        and
-            SI->>SI: phase1a: mount /proc /sys /dev<br>wait vda+vdb → erofs(vda ro)+ext4(vdb rw) → overlayfs → /sysroot
-        end
-        SI->>SI: applyVolumeMounts（empty 卷 bind，switch-root 前）
-        SI->>SI: phase1b: MS_MOVE /sysroot→/ + chroot<br>devpts + cgroup v2 + /run
-        SI->>SI: bringUpLoopback
-        SI->>SI: phase2: applyNetwork / applyFsMounts / applyFiles / runInit
-        SI->>SI: setupAppStdio（pty master/slave 或 pipe）
-        SI->>SC: TypeLaunchAck{Stdio}（整个 spec 已应用，host OnLaunchAck 回调触发）
-        SC-->>SI: TypeAck
-        Note over SC,SI: launch 连接升级为 stdio MUX（mux.NewSession）
-        SI->>SI: phase2ForkApp: CLONE_NEWNS+CLONE_NEWPID → re-exec exec-child → execve user app
-        SI->>SI: cgroupPlaceApp（app 进程树放入 app cgroup，quiesce freeze 依赖）
-        SI->>SC: TypeAppStarted{pid}
-    else kind=snp（快照恢复）
-        SC->>CH: PUT /vm.resume（ch.sock CH API）
-        CH-->>SC: 204 resumed
-        SC->>SI: 建立 MUX（vsock reverse channel）
+    Note over CH,SI: kernel 启动 → sandbox-init PID 1 启动
+    SI->>SI: bind vsock :5000（反向通道监听，必须在 hello 前）
+    par 握手与 overlay 组装并发
+        SI->>SC: connect(vsock port 5000)
+        SI->>SC: TypeHello{phase:"ready"}
+        SC-->>SI: TypeLaunch(LaunchSpec)
+    and
+        SI->>SI: phase1a: mount /proc /sys /dev<br>wait vda+vdb → erofs(vda ro)+ext4(vdb rw) → overlayfs → /sysroot
     end
+    SI->>SI: applyVolumeMounts（empty 卷 bind，switch-root 前）
+    SI->>SI: phase1b: MS_MOVE /sysroot→/ + chroot<br>devpts + cgroup v2 + /run
+    SI->>SI: bringUpLoopback
+    SI->>SI: phase2: applyNetwork / applyFsMounts / applyFiles / runInit
+    SI->>SI: setupAppStdio（pty master/slave 或 pipe）
+    SI->>SC: TypeLaunchAck{Stdio}（整个 spec 已应用，host OnLaunchAck 回调触发）
+    SC-->>SI: TypeAck
+    Note over SC,SI: launch 连接升级为 stdio MUX（mux.NewSession）
+    SI->>SI: phase2ForkApp: CLONE_NEWNS+CLONE_NEWPID → re-exec exec-child → execve user app
+    SI->>SI: cgroupPlaceApp（app 进程树放入 app cgroup，quiesce freeze 依赖）
+    SI->>SC: TypeAppStarted{pid}
     SC->>SC: pinger.Start + BalloonController.Start
     O->>E: poll /health（60s，仅 e2b）
     E-->>O: 200 OK
@@ -411,7 +446,44 @@ sequenceDiagram
     O-->>C: 201 sandboxResp
 ```
 
-### 4.3 沙箱 Pause 流程
+#### 4.2.2 快照恢复（kind=snp · Story 2）
+
+sandbox-ctl run 携带 `--restore manifest://<key>`，uffd handler 使用 `StreamSnapshotSource` 按需从快照层填充内存页；CH 以 `--restore` 模式启动，直接从快照断点继续执行（无 kernel boot 过程）。
+
+**与 §4.4 Connect / Resume 的关系**：sandbox-ctl run `--restore` 内部执行的快照恢复序列与 §4.4（Connect / Resume）中的 sandbox-ctl run 路径完全相同——打开 bundle、重建磁盘 CoW、spawn CH `--restore`、PUT /vm.resume、restore notify——详见 §4.4 时序图。Create（kind=snp）与 Resume 的唯一区别在于外层编排：Create 先执行 `st.Put(state=running)` 写入新行，Resume 则在已有 paused 行上 `SetState(running)`。
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant O as node-ctl
+    participant DB as SQLite
+    participant VS as connector-ctl-vswitch
+    participant SD as systemd
+    participant RS as node-ctl run-sandbox
+    participant SC as sandbox-ctl run
+    participant E as envd(guest)
+    participant P as proxy
+
+    C->>O: POST /sandboxes（kind=snp）
+    O->>O: resolveAllowed / ParseTemplateID / MintToken×2<br>snapshotConfig（读快照 capacity + network）
+    O->>VS: Attach(innerIP) connector-ctl vswitch attach
+    VS-->>O: Port{floatingIP,MAC}
+    O->>DB: st.Put(state=running)
+    O->>SD: lc.Start(sandbox-runner@sid)
+    SD->>RS: ExecStart=node-ctl run-sandbox
+    RS->>O: fetch LaunchSpec (config-socket task plane)
+    O-->>RS: {exec:sandbox-ctl, --restore manifest://<key>, MANIFEST_KEY}
+    RS->>SC: syscall.Exec → sandbox-ctl run --restore（同 PID）
+    Note over SC: 快照恢复序列（打开 bundle → 重建 CoW → spawn CH --restore<br>→ PUT /vm.resume → restore notify）详见 §4.4 时序图
+    SC->>SC: pinger.Start + BalloonController.Start
+    O->>E: poll /health（仅 e2b，token 重新颁发）
+    E-->>O: 200 OK
+    O->>E: POST /init（env + token，仅 e2b）
+    O->>P: publishUpsert(sb)
+    O-->>C: 201 sandboxResp
+```
+
+### 4.3 沙箱 Pause（Story 3 · 暂停）
 
 ```
 POST /sandboxes/{id}/pause
@@ -494,7 +566,7 @@ sequenceDiagram
     O-->>C: 204
 ```
 
-### 4.4 沙箱 Connect/Resume 流程
+### 4.4 沙箱 Connect / Resume（Story 3 · 唤醒）
 
 ```
 POST /sandboxes/{id}/connect
@@ -568,89 +640,7 @@ sequenceDiagram
     O-->>C: 200 sandboxResp
 ```
 
-### 4.5 沙箱 Exec 流程
-
-```
-POST /sandboxes/{id}/exec
-  │
-  ▼ api.exec → orch.Exec(ctx, id, req, apiKey)
-  1. st.Get(id) → sb；若 sb == nil → 404
-  2. ownsSandbox(sb, apiKey) → 403/404
-  3. 若 sb.State == dead → 404
-  4. 若 sb.State == paused:
-       sf.Do(sid, resumeIfPaused)   ← 与 /connect 共用同一单飞路径
-         └── resume 完成后继续执行（TTL 不因 exec 延长）
-  5. timeout = min(req.TimeoutMs 若为 0 取 30_000, 300_000) ms
-     deadline = now + timeout ms        ← 在步骤 4 完成后重新计算 now
-  6. exec sandbox-ctl exec \
-         --sid <id> \
-         --cmd <req.Cmd> \
-         --env <req.Envs> \
-         --cwd <req.Cwd> \
-         --timeout-ms <deadline - now>  ← fork 时动态计算剩余时间
-       sandbox-ctl exec → ctl.sock → sandbox-ctl run → vsock → sandbox-init；
-       sandbox-init setns(mnt+pid) 后 forkExecChild，stdout/stderr 经 MUX 透传；
-       sandbox-ctl exec 以命令退出码作为自身退出码（fd=3 JSON 为 node-ctl 侧计划接口）；
-       内部错误（连不上 ctl.sock 或 vsock 通道等）：sandbox-ctl exec 以非零退出，stderr 记录原因
-  7. node-ctl 累积 stdout + stderr；合计超过 10 MiB 时停止读取，标记 truncated=true
-  8. 等待子进程退出，或 deadline 到期
-       a. 正常退出：读取 fd=3 JSON → exit_code=N
-       b. deadline 到期：SIGKILL sandbox-ctl exec → exit_code=-1
-       c. fd=3 为空（内部错误）：返回 500，日志记录 stderr
-  9. return ExecResult{Stdout, Stderr, ExitCode, DurationMs, Truncated}
-```
-
-**与其他 sandbox-ctl 调用的一致性**：`exec sandbox-ctl exec` 与 `exec sandbox-ctl snapshot`、`exec sandbox-ctl info` 遵循同一模式——node-ctl 不直接持有 per-sandbox 的 envd 连接，所有 guest 侧细节封装在 sandbox-ctl 内。
-
-**与 /connect 的关系**：步骤 4 的自动恢复与 `/connect` 走完全相同的 `sf.Do(sid, resumeIfPaused)` 路径——先到的 goroutine 执行恢复，后到的等待同一 future，不会触发双重 launch。exec 不延长 TTL；若沙箱的 TTL 在命令执行期间到期，Reaper 会 pause 沙箱，sandbox-ctl exec 因 vsock 通道中断而返回内部错误（步骤 8c）。
-
-**并发语义**：同一沙箱可并发多个 exec 请求，每次调用独立 fork 一个 sandbox-ctl exec 子进程；node-ctl 层不额外限流。
-
-**超时语义**：`timeout_ms` 超时（步骤 8b）时命令被 SIGKILL，响应码仍为 `200`，`exit_code=-1`（命令超时属业务语义）；若沙箱在恢复阶段超时，返回 `503`；若 sandbox-ctl exec 内部错误，返回 `500`。
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant O as node-ctl
-    participant SE as sandbox-ctl exec
-    participant SR as sandbox-ctl run
-    participant SI as sandbox-init(guest)
-
-    C->>O: POST /sandboxes/{id}/exec
-    O->>O: st.Get(id) / ownsSandbox / state 校验
-    alt state=paused
-        O->>O: sf.Do(resumeIfPaused)
-    end
-    O->>O: 计算 deadline（now + min(timeout_ms, 300_000)）
-    O->>SE: fork sandbox-ctl exec<br>--sid --cmd --env --cwd --user --timeout-ms
-    SE->>SR: TypeExecRequest（argv/env/cwd/user/StdioSpec）via ctl.sock
-    SR->>SI: 建立 vsock exec channel，转发 ExecSpec
-    SI->>SI: setns(mnt+pid) + forkExecChild
-    SI-->>SR: exec ack（命令已 fork）
-    SR-->>SE: TypeExecAck（StdioSpec）via ctl.sock
-    Note over SE,SR: ctl.sock 连接升级为 stdio MUX（mux.NewSession）
-    Note over SR,SI: vsock 连接升级为 stdio MUX（SR relay 两端）
-    loop stdout / stderr 流式输出
-        SI->>SR: MUX 帧（stdout/stderr data）
-        SR->>SE: MUX 帧转发
-        SE->>O: pipe 写入（O 侧 goroutine 累积；超 10 MiB 截断，truncated=true）
-    end
-    SI->>SR: MUX ExitStatus（exit_code=N）
-    SR->>SE: MUX ExitStatus 转发
-    SE->>SE: sess.ExitReceived()；以 exitCode 退出
-    alt 正常退出
-        SE-->>O: 子进程退出（exitCode=N）
-        O-->>C: 200 ExecResult{stdout,stderr,exitCode,durationMs,truncated}
-    else deadline 到期
-        O->>SE: SIGKILL
-        O-->>C: 200 {exitCode=-1, truncated}
-    else ctl.sock/vsock 连接失败
-        SE-->>O: 非零退出 + stderr 错误信息
-        O-->>C: 500
-    end
-```
-
-### 4.6 Reaper（TTL 自动挂起）
+### 4.5 Reaper（Story 4 · TTL 自动挂起 + 深度休眠触发）
 
 `Reaper` 每 5s 运行，分三步：
 
@@ -780,7 +770,7 @@ sequenceDiagram
     O->>P: publishUpsert(running) ← proxy 放行 park 队列
 ```
 
-### 4.7 Reconcile（启动恢复）
+### 4.6 Reconcile（启动恢复）
 
 conductor 启动时运行 `Reconcile`，将 store 中 running 状态与 systemd 实际活跃 unit 对齐：
 
@@ -839,7 +829,7 @@ sequenceDiagram
     Note over O,P: Reconcile 阶段通常无 proxy 订阅者，publishUpsert/Delete 均为 no-op<br>proxy 重连后通过 Range() 全量快照同步路由；alive 沙箱的 TTL 由 Reaper 接管
 ```
 
-### 4.8 Deep-idle 跨节点 Resume（集群模式）
+### 4.7 深度休眠跨节点 Resume（Story 4 · 集群唤醒路径）
 
 deep-idle 提升为 SAVED 后，registry 持有 migration token，下次有 `(group, route_key)` 触发时由 registry 自动在任意节点执行 import + restore，对客户端透明。
 
@@ -893,7 +883,89 @@ sequenceDiagram
     CR-->>C: DataEndpoint（目标节点地址）
 ```
 
-### 4.9 Export / Import（跨节点迁移）
+### 4.8 沙箱 Exec（Story 6 · 在沙箱中执行命令）
+
+```
+POST /sandboxes/{id}/exec
+  │
+  ▼ api.exec → orch.Exec(ctx, id, req, apiKey)
+  1. st.Get(id) → sb；若 sb == nil → 404
+  2. ownsSandbox(sb, apiKey) → 403/404
+  3. 若 sb.State == dead → 404
+  4. 若 sb.State == paused:
+       sf.Do(sid, resumeIfPaused)   ← 与 /connect 共用同一单飞路径
+         └── resume 完成后继续执行（TTL 不因 exec 延长）
+  5. timeout = min(req.TimeoutMs 若为 0 取 30_000, 300_000) ms
+     deadline = now + timeout ms        ← 在步骤 4 完成后重新计算 now
+  6. exec sandbox-ctl exec \
+         --sid <id> \
+         --cmd <req.Cmd> \
+         --env <req.Envs> \
+         --cwd <req.Cwd> \
+         --timeout-ms <deadline - now>  ← fork 时动态计算剩余时间
+       sandbox-ctl exec → ctl.sock → sandbox-ctl run → vsock → sandbox-init；
+       sandbox-init setns(mnt+pid) 后 forkExecChild，stdout/stderr 经 MUX 透传；
+       sandbox-ctl exec 以命令退出码作为自身退出码（fd=3 JSON 为 node-ctl 侧计划接口）；
+       内部错误（连不上 ctl.sock 或 vsock 通道等）：sandbox-ctl exec 以非零退出，stderr 记录原因
+  7. node-ctl 累积 stdout + stderr；合计超过 10 MiB 时停止读取，标记 truncated=true
+  8. 等待子进程退出，或 deadline 到期
+       a. 正常退出：读取 fd=3 JSON → exit_code=N
+       b. deadline 到期：SIGKILL sandbox-ctl exec → exit_code=-1
+       c. fd=3 为空（内部错误）：返回 500，日志记录 stderr
+  9. return ExecResult{Stdout, Stderr, ExitCode, DurationMs, Truncated}
+```
+
+**与其他 sandbox-ctl 调用的一致性**：`exec sandbox-ctl exec` 与 `exec sandbox-ctl snapshot`、`exec sandbox-ctl info` 遵循同一模式——node-ctl 不直接持有 per-sandbox 的 envd 连接，所有 guest 侧细节封装在 sandbox-ctl 内。
+
+**与 /connect 的关系**：步骤 4 的自动恢复与 `/connect` 走完全相同的 `sf.Do(sid, resumeIfPaused)` 路径——先到的 goroutine 执行恢复，后到的等待同一 future，不会触发双重 launch。exec 不延长 TTL；若沙箱的 TTL 在命令执行期间到期，Reaper 会 pause 沙箱，sandbox-ctl exec 因 vsock 通道中断而返回内部错误（步骤 8c）。
+
+**并发语义**：同一沙箱可并发多个 exec 请求，每次调用独立 fork 一个 sandbox-ctl exec 子进程；node-ctl 层不额外限流。
+
+**超时语义**：`timeout_ms` 超时（步骤 8b）时命令被 SIGKILL，响应码仍为 `200`，`exit_code=-1`（命令超时属业务语义）；若沙箱在恢复阶段超时，返回 `503`；若 sandbox-ctl exec 内部错误，返回 `500`。
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant O as node-ctl
+    participant SE as sandbox-ctl exec
+    participant SR as sandbox-ctl run
+    participant SI as sandbox-init(guest)
+
+    C->>O: POST /sandboxes/{id}/exec
+    O->>O: st.Get(id) / ownsSandbox / state 校验
+    alt state=paused
+        O->>O: sf.Do(resumeIfPaused)
+    end
+    O->>O: 计算 deadline（now + min(timeout_ms, 300_000)）
+    O->>SE: fork sandbox-ctl exec<br>--sid --cmd --env --cwd --user --timeout-ms
+    SE->>SR: TypeExecRequest（argv/env/cwd/user/StdioSpec）via ctl.sock
+    SR->>SI: 建立 vsock exec channel，转发 ExecSpec
+    SI->>SI: setns(mnt+pid) + forkExecChild
+    SI-->>SR: exec ack（命令已 fork）
+    SR-->>SE: TypeExecAck（StdioSpec）via ctl.sock
+    Note over SE,SR: ctl.sock 连接升级为 stdio MUX（mux.NewSession）
+    Note over SR,SI: vsock 连接升级为 stdio MUX（SR relay 两端）
+    loop stdout / stderr 流式输出
+        SI->>SR: MUX 帧（stdout/stderr data）
+        SR->>SE: MUX 帧转发
+        SE->>O: pipe 写入（O 侧 goroutine 累积；超 10 MiB 截断，truncated=true）
+    end
+    SI->>SR: MUX ExitStatus（exit_code=N）
+    SR->>SE: MUX ExitStatus 转发
+    SE->>SE: sess.ExitReceived()；以 exitCode 退出
+    alt 正常退出
+        SE-->>O: 子进程退出（exitCode=N）
+        O-->>C: 200 ExecResult{stdout,stderr,exitCode,durationMs,truncated}
+    else deadline 到期
+        O->>SE: SIGKILL
+        O-->>C: 200 {exitCode=-1, truncated}
+    else ctl.sock/vsock 连接失败
+        SE-->>O: 非零退出 + stderr 错误信息
+        O-->>C: 500
+    end
+```
+
+### 4.9 Export / Import（Story 5 · 跨节点迁移）
 
 **Export**（`orch.ExportSandbox`）：
 
