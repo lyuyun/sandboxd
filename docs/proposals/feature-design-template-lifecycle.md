@@ -806,8 +806,9 @@ BuildPool(ctx, interval=5s)
             select sem <- struct{}{}:                   // 抢占槽位
                 won = CASBuildStatus(waiting → building) // DB 层防重复认领
                 if !won: <-sem; continue                // 其他实例已认领，退回槽位
+                publishBuildState(bid, "building")      // 集群侧 build_event 上行（单节点为 no-op）
                 go executeBuild(b):
-                    lc.Start(unit)                      // 阻塞至单元退出
+                    runBuildUnit(b)                     // allocInnerIP + vs.Attach + lc.Start（阻塞至单元退出）
                     <-sem                               // 释放槽位
             default:
                 break                                   // 池满，跳过本轮剩余
@@ -820,7 +821,7 @@ BuildPool(ctx, interval=5s)
 | 计数信号量 `sem` | 限制同时运行的 `sandbox-builder@<bid>` 单元数 ≤ `builder.max_concurrent` |
 | `CASBuildStatus` | 防止多实例（重启恢复场景）或同一 tick 内并发 goroutine 重复认领同一构建 |
 
-`lc.Start(unit)` 在 Type=oneshot 单元退出前阻塞，因此信号量槽位覆盖了构建的完整执行周期，不会出现槽位提前释放导致超发的情况。
+`lc.Start(unit)` 在 Type=oneshot 单元退出前阻塞，因此信号量槽位覆盖了构建的完整执行周期，不会出现槽位提前释放导致超发的情况。`publishBuildState("building")` 在 CAS 成功后、goroutine 派发前同步调用，非 cluster build 时为 no-op。
 
 #### 4.8.2 run-builder 进程资源控制
 
@@ -846,9 +847,42 @@ systemd (PID 1)
 
 #### 4.8.3 node-ctl conductor 重启恢复
 
-conductor 重启后，`pend` map 清空，正在运行的 `sandbox-builder@<bid>` 单元无法通过 config-socket 获取 BuildSpec，run-builder 退出并将构建置为 error。
+**当前行为（存在缺陷）**
 
-重启后 BuildPool 扫描到 `building` 状态的残留记录时，当前版本**不自动重试**（CAS 无法从 building 迁移到 waiting），需运维手动将状态重置为 waiting 后由下一个 tick 重新调度。
+conductor 重启时，`pend` map 清空、所有 `executeBuild` goroutine 随进程消失，但 `sandbox-builder@<bid>` 单元由 systemd 管理，可能仍在运行。重启后各资源的状态如下：
+
+| 资源 | 重启后状态 | 问题 |
+|------|-----------|------|
+| `pend[bid]`（innerIP / port / envdToken） | 重启后 `pend` 是空 map，查询即 nil | `BuildSpecFor` 返回 not-found，单元无法获取 spec，run-builder 退出 |
+| `sandbox-builder@<bid>` 单元 | 可能仍 active（systemd 独立于 conductor） | 若已完成 spec 拉取并在执行中，仍会写出 result 文件，但无 goroutine 读取 |
+| result 文件（`<RunRoot>/<bid>/<bid>.result`） | 遗留在磁盘（`defer os.RemoveAll` 未执行） | 构建产物无法被消费 |
+| vswitch slot（`vs.Attach` 已成功） | `vs.Detach` 的 defer 未执行，**slot 永久泄漏** | 每次重启累积泄漏，最终耗尽 slot |
+| builds 表中 `building` 记录 | **永久滞留**——BuildPool 只扫 `waiting`，不扫 `building` | 需运维手动重置 |
+
+**设计目标：ReconcileBuilds**
+
+类比 `Reconcile`（sandbox 重启恢复），增加 `ReconcileBuilds` 在 conductor 启动时执行：
+
+```
+ReconcileBuilds(ctx):
+│
+├── building = st.BuildsByStatus(ctx, building)
+└── for b in building:
+        if sandbox-builder@<bid> is active:
+            lc.Stop(<bid>)                    // 单元仍在运行但 pend 已丢失，无法继续，强制终止
+        // vswitch slot：port 未持久化，无法主动归还；
+        //   依赖 vswitch 在连接断开时自动回收，或持久化 port 到 builds 表后方可在此 Detach
+        result = readResultFile(<bid>)        // 尝试读取遗留 result 文件
+        if result exists && no error:
+            PutBuild(status=ready, PersistID=...)  // 恢复已完成的构建
+        else:
+            CASBuildStatus(building → waiting)     // 重新入队，下一 tick 自动重试
+        os.RemoveAll(<RunRoot>/<bid>/)        // 清理遗留 workdir
+```
+
+**vswitch slot 泄漏的根本解法**：在 `runBuildUnit` 里 `vs.Attach` 成功后、`lc.Start` 之前把 port 写入 builds 表，`ReconcileBuilds` 从 DB 读 port 后调 `vs.Detach(port)` 归还。当前 port 未落盘，`ReconcileBuilds` 只能依赖 vswitch 侧连接断开时自动回收。
+
+`waiting` 状态的构建无需 `ReconcileBuilds` 介入——BuildPool 下一 tick 扫 `BuildsByStatus(waiting)` 自动捡回。
 
 ### 4.9 快照创建路径 B：pause + export（bare profile）
 
@@ -1785,7 +1819,7 @@ write manifest(key2)     # G2 manifest key
 |---------|---------|---------|
 | Phase sandbox OOM | sandbox-ctl 进程退出，`lc.Start` 返回错误 | executeBuild 将 build 置为 error，释放 vswitch slot |
 | manifest store 不可达 | `uploadImage`/`uploadSnapshot` 返回错误，run-builder 输出 `error` 字段 | build 置为 error，网络恢复后需重新触发构建 |
-| node-ctl conductor 重启 | `pend` map 丢失，`BuildSpecFor` 返回 not found | 运行中的 `sandbox-builder@<bid>` 单元无法获取 spec，构建失败；重启后 BuildPool 扫描 `building` 状态并重置（需额外实现，当前版本不自动重试） |
+| node-ctl conductor 重启 | `pend` map 丢失，`BuildSpecFor` 返回 not found；`building` 记录永久滞留，vswitch slot 泄漏（`vs.Detach` defer 未执行） | 待实现 `ReconcileBuilds`（§4.8.3）：归还 vswitch slot，尝试读取 result 文件，已完成则置 ready，否则置 waiting 自动重试 |
 | vswitch Attach 失败 | `runBuildUnit` 直接返回 error | build 置为 error，vswitch 未占用，自动释放 |
 | readyCmd 超时 | `phaseTemplate` 返回超时 error | build 置为 error，Phase C sandbox 通过 `defer sb.teardown()` 清理 |
 
