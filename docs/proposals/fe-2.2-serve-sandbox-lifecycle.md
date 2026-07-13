@@ -18,12 +18,12 @@
 
 | # | 目标 | 验收方法 |
 |---|------|---------|
-| G-1 | 兼容 e2b SDK 发出的 REST 请求（create/get/list/kill/pause/connect/timeout）| e2b Python SDK 不改动直接对接 |
+| G-1 | 兼容 e2b SDK 发出的 REST 请求（create/get/list/kill/pause/connect/timeout/exec），支持 kind=img 冷启动和 kind=snp 快照启动两种模式 | e2b Python SDK 不改动直接对接；分别以 kind=img 和 kind=snp 模板创建沙箱，均返回有效 {sandboxID, envdAccessToken, domain} |
 | G-2 | 沙箱生命周期状态（running/paused/dead）持久化，conductor 重启后可恢复 | kill -9 conductor 后重启，running 沙箱被正确 adopt 或 teardown |
 | G-3 | paused 沙箱可通过 /connect 或数据面流量透明唤醒 | SDK `sandbox.resume()` 及 park/wake 路径均可触发恢复 |
-| G-4 | TTL 超时自动挂起（pause），不中断数据面已建连接 | timeout=300s 的沙箱 300s 后自动进入 paused |
-| G-5 | 沙箱跨节点迁移（export/import）：将暂停沙箱打包为 base64 token，在另一节点导入恢复 | `node-ctl export-sandbox` / `node-ctl import-sandbox` 可正常执行 |
-| G-6 | 在 running 沙箱内执行任意命令（exec），支持同步返回 stdout/stderr 及退出码 | `POST /sandboxes/{id}/exec` 在沙箱内运行 `echo hello`，返回正确 stdout 和 exitCode=0 |
+| G-4 | TTL 超时自动挂起（pause），不中断数据面已建连接；集群模式下 deep_idle_sec 到期后进入深度休眠（SAVED）| timeout=300s 的沙箱 300s 后自动进入 paused；集群模式下深度休眠后可在任意节点 import + resume |
+| G-5 | 沙箱跨节点迁移（export/import）：将暂停沙箱打包为含 snapshot manifest ref 的 migration token，在另一节点导入恢复 | `node-ctl export-sandbox` / `node-ctl import-sandbox` 可正常执行；导入后沙箱以 paused 状态存在于目标节点，connect 后可正常使用 |
+| G-6 | 在 running/paused 沙箱内同步执行任意命令（exec），支持返回 stdout/stderr 及退出码；paused 沙箱自动恢复后执行；dead 沙箱返回 404 | `POST /sandboxes/{id}/exec` 在沙箱内运行 `echo hello`，返回正确 stdout 和 exitCode=0；paused 沙箱自动恢复后执行成功 |
 | G-7 | 多租户隔离：每个 API Key 只能操作自己的沙箱 | 不同 API Key 之间的沙箱完全隔离 |
 
 **Non-Goals**
@@ -76,51 +76,61 @@
 
 ### 3.1 User Stories
 
-#### Story 1：SDK 创建并使用沙箱
+#### Story 1：基于展平镜像冷启动沙箱
 
 ```
-作为一个 SDK 用户，我想要通过 e2b.Sandbox.create(template_id) 启动一个沙箱，
-以便在其中执行代码或命令。
+作为一个 SDK 用户，我想要通过模板 ID（kind=img）从展平 erofs 镜像冷启动一个沙箱，
+以便在干净的模板环境中运行代码或命令。
 ```
 
-**外部表现**：POST /sandboxes 返回 {sandboxID, envdAccessToken, domain}；SDK 持有 token 后可通过 `<port>-<sid>.<domain>` 接入 envd 或用户端口。运维人员无需感知：沙箱在节点上作为 systemd 服务实例运行。
+**外部表现**：POST /sandboxes 指定 kind=img 的 template_id；conductor 从 manifest store 读取 `bare-img-<key>`，经 vhost-blk 挂载后启动 VM，等待 envd /health 就绪（最长 60s）；返回 `{sandboxID, envdAccessToken, domain}`。SDK 持有 token 后可通过 `<port>-<sid>.<domain>` 接入 envd 或用户端口。沙箱以 `sandbox-runner@<sid>.service` 运行，调用方无需感知节点细节。
 
-#### Story 2：SDK 挂起并唤醒沙箱
+#### Story 2：基于内存快照启动沙箱
 
 ```
-作为一个 SDK 用户，我想要挂起一个沙箱（保留状态快照），并在需要时无感恢复，
-以便降低计费并在数分钟内复用沙箱状态。
+作为一个 SDK 用户，我想要从模板的预置内存快照（kind=snp）快速恢复沙箱，
+以便跳过 OS boot 和 envd 初始化，获得比冷启动更短的就绪时间。
 ```
 
-**外部表现**：POST /sandboxes/{id}/pause 触发 CH 原生 VM snapshot；后续 POST /sandboxes/{id}/connect 或数据面流量触发透明恢复，客户端无需重试（park/wake 机制）。
+**外部表现**：POST /sandboxes 指定 kind=snp 的 template_id；conductor 从 manifest store 读取快照 chunks，经 CH restore 恢复 CPU + 内存 + 设备状态，envd 接受请求后立即返回 `{sandboxID, envdAccessToken, domain}`；相同内容块跨沙箱/跨模板共享（FastCDC + 收敛加密 dedup），启动延迟显著低于冷启动。
 
-#### Story 3：运维人员迁移沙箱到另一节点
+#### Story 3：沙箱暂停和唤醒
+
+```
+作为一个 SDK 用户，我想要主动暂停一个运行中的沙箱（保留全量内存快照），
+并在需要时通过 API 或数据面流量透明唤醒，
+以便在不丢失执行状态的前提下节省计算资源。
+```
+
+**外部表现**：POST /sandboxes/{id}/pause 触发 CH 原生 VM snapshot + vswitch slot 释放，快照经 FastCDC + 收敛加密写入 manifest store；proxy 路由切换为 park 模式，已建连接不中断；后续 POST /sandboxes/{id}/connect 或数据面流量触发透明 resume（sf.Do 单飞去重），客户端无需重试。
+
+#### Story 4：沙箱超时自动挂起和深度休眠
+
+```
+作为一个平台运营者，我希望空闲超过 TTL 的沙箱被自动挂起以回收计算资源，
+长时间无访问的沙箱进入深度休眠以释放节点 slot，
+以便提升节点利用率、降低运营成本。
+```
+
+**外部表现**：Reaper 每 5s 扫描 running 表，`deadline_unix < now` → 自动 pauseSandbox（vswitch slot 释放，proxy 切换 park 模式，数据面已建连接不中断）；集群模式下 `deep_idle_sec` 到期 → promoteToSaved（节点记录删除，registry 持有 `SAVED + migration token`），任意节点可通过 `ReserveSandbox → import + resume` 恢复为 running。
+
+#### Story 5：跨节点迁移沙箱
 
 ```
 作为一个运维人员，我想要将一个已暂停的沙箱从节点 A 迁移到节点 B，
-以便在节点 A 下线前保全沙箱状态。
+以便在节点 A 计划下线前保全沙箱状态，在新节点继续使用。
 ```
 
-**外部表现**：`node-ctl export-sandbox <sid>` 输出 base64 token；在节点 B 执行 `node-ctl import-sandbox <token>`，再 `e2b sandbox resume <sid>` 恢复。
+**外部表现**：`node-ctl export-sandbox <sid>` 输出 base64 migration token（含 snapshot manifest ref + 元数据）；在节点 B 执行 `node-ctl import-sandbox <token>` 导入为 paused 状态；再通过 `POST /sandboxes/{id}/connect` 或 `e2b sandbox resume <sid>` 恢复；原节点记录删除，新节点持有完整快照，对 SDK 用户透明。
 
-#### Story 4：SDK 在沙箱内执行命令
-
-```
-作为一个 SDK 用户，我想要在 running（或 paused）沙箱内同步执行任意命令，
-并获取 stdout、stderr 和退出码，
-以便在沙箱中完成构建、测试或状态检查等操作。
-```
-
-**外部表现**：POST /sandboxes/{id}/exec 携带 `{cmd, envs, cwd, timeout_ms}`；若沙箱处于 paused 状态则自动恢复后执行；命令完成后返回 `{stdout, stderr, exit_code, duration_ms}`；超时时命令被 SIGKILL，exit_code=-1，HTTP 仍为 200。
-
-#### Story 5：TTL 到期自动挂起
+#### Story 6：在沙箱中执行命令
 
 ```
-作为一个平台运营者，我希望超过 TTL 的沙箱被自动挂起，
-以便回收计算资源，避免僵尸沙箱占用 slot。
+作为一个 SDK 用户，我想要在沙箱内同步执行任意命令并获取 stdout、stderr 和退出码，
+以便在沙箱环境中完成构建、测试或文件操作等任务。
 ```
 
-**外部表现**：Reaper 每 5s 扫描 running 表，deadline_unix < now → 自动 pauseSandbox；沙箱进入 paused，vswitch slot 释放，数据面 proxy 感知路由变更（state=paused）。
+**外部表现**：POST /sandboxes/{id}/exec 携带 `{cmd, envs, cwd, timeout_ms}`；paused 沙箱自动恢复后执行；命令完成后返回 `{stdout, stderr, exit_code, duration_ms}`；stdout + stderr 合计不超过 10 MiB（超出截断并附 `"truncated": true`）；超时时命令被 SIGKILL，`exit_code: -1`，HTTP 仍为 200；dead 沙箱返回 404。
 
 ### 3.2 架构影响分析
 
