@@ -1671,12 +1671,17 @@ generation 未变 → salt 未变 → re-encrypt 产出同 key1 → **本质 no-
 
 #### Path 1（fromImage）
 
+`--with-referer` 依 `valid_at` 是否过期呈现两种不同行为：
+
 | 子路径 | 步骤 | 代价 |
 |--------|------|------|
-| 有 `--with-referer` | Referrers 命中 key1（G1 key）→ `valid_at` 未过期则**直接返回 key1**，不检查是否在 active G2 | 语义存疑：返回的是 G1 key，功能上暂时可用，但 G1 purge 后失效 ⚠️ |
-| 无 `--with-referer` | OCI pull（外网）→ mkfs.erofs → G2 ingest：`Exists(G2_key)` 全 miss，**0% dedup，所有 chunk 重新上传** | 30–210 s（G2 下最差情形） |
+| `--with-referer` + `valid_at` **未过期**（2a） | Referrers 命中 key1（G1 key）→ `valid_at` 通过 → **直接返回 key1**，不检查是否在 active G2 | < 1 s；返回旧代 key，G1 purge 后失效 ⚠️ |
+| `--with-referer` + `valid_at` **已过期**（2b） | Referrers 命中 key1 → `valid_at` 校验失败 → **referer miss，回退标准路径**：OCI pull + mkfs.erofs + G2 ingest（0% dedup） | 30–210 s；行为正确，代价等同无 referer |
+| 无 `--with-referer` | OCI pull（外网）→ mkfs.erofs → G2 ingest：`Exists(G2_key)` 全 miss，0% dedup | 30–210 s |
 
-`--with-referer` 存在代沟问题：referrer 记录的是 G1 key，generation 换代后 `valid_at` 可能仍在有效期内，系统无感知地返回旧代 key，直到 G1 被 purge 才暴露问题。
+**子情况分析**：
+- **2a**（`valid_at` 未过期）：generation rollout 发生在 referrer 写入之后、`valid_at` 到期之前的窗口内。`--with-referer` 静默返回旧代 key1，调用方无感知，直到 G1 被 purge 后 key1 失效才暴露问题。这是 generation 感知 gap（§4.11.7 修复目标）。
+- **2b**（`valid_at` 已过期）：referrer 校验本身已阻断快速路径，系统退化为标准重建，行为正确但无性能收益，代价与无 referer 完全相同（30–210 s）。
 
 #### Path 2（re-encrypt）
 
@@ -1701,7 +1706,8 @@ write manifest(key2)     # G2 manifest key
 
 | 方案 | dedup | 耗时 | 备注 |
 |------|-------|------|------|
-| Path 1 + `--with-referer` | — | < 1 s | 返回 G1 key，generation 感知错误 ⚠️ |
+| Path 1 + `--with-referer`，`valid_at` 未过期（2a） | — | < 1 s | 返回旧代 G1 key，generation 感知错误 ⚠️ |
+| Path 1 + `--with-referer`，`valid_at` 已过期（2b） | 0% | 30–210 s | referer miss，退化为完整重建；行为正确，代价等同无 referer |
 | Path 1（无 referer） | 0% | 30–210 s | 最差情形 |
 | Path 2（re-encrypt） | 0% | 2–8 s | 10×–50× 优于 Path 1；依赖 G1 未 purge |
 
@@ -1709,14 +1715,26 @@ write manifest(key2)     # G2 manifest key
 
 | | Case 1（G 未变） | Case 2（G 已变） |
 |---|---|---|
-| **Path 1 + `--with-referer`** | 近 0 代价，返回 key1 ✓ | 返回旧代 G1 key，语义存疑 ⚠️ |
+| **Path 1 + `--with-referer`**<br/>（`valid_at` 未过期，2a） | 近 0 代价，返回 key1 ✓ | < 1 s，但返回旧代 G1 key，G1 purge 后失效 ⚠️ |
+| **Path 1 + `--with-referer`**<br/>（`valid_at` 已过期，2b） | N/A（referer miss，退化为下行） | 30–210 s，行为正确，退化为完整重建 |
 | **Path 1 无 referer** | mkfs.erofs 固定成本，10–60 s ✗ | OCI pull + mkfs.erofs，30–210 s ✗✗ |
 | **Path 2（re-encrypt）** | no-op，< 100 ms ✓✓ | 省 pull/flatten，2–8 s ✓；依赖 G1 未 purge |
 
 ### 4.11.7 设计建议
 
 1. **短期**：继续使用 Path 1 + `--with-referer`。在 generation 未变（Case 1）的主路径下，referer 命中率高，代价接近 0。
-2. **generation 感知**：`--with-referer` 当前只校验 `owner` + `valid_at`，不感知 generation。由于 generation 是 store 全局的，一次 rollout 会使 store 内**所有** template 的 referrer key 同时失效——而 `valid_at` 仍在有效期内，导致批量返回旧代 key。修复方式：拿到 referrer key 后，对 manifest partition 调用 `Exists(key)`；若返回 false（key 不在 active generation），视为 stale，回退到完整重建流程，并在重建完成后以新 key 覆写 referrer。
+
+2. **generation 感知修复**（针对 Case 2 sub-case 2a）：
+
+   `--with-referer` 当前只校验 `owner` + `valid_at`，不感知 generation，导致以下两种 Case 2 行为不对称：
+
+   | sub-case | `valid_at` 状态 | 当前行为 | 问题 |
+   |----------|----------------|---------|------|
+   | **2a** | 未过期 | 直接返回 G1 key，**不检查 active gen** | ⚠️ 静默返回旧代 key；generation 是 store 全局的，一次 rollout 导致**所有** template 批量命中此问题 |
+   | **2b** | 已过期 | `valid_at` 校验失败 → referer miss → 完整重建 | 行为正确，代价 30–210 s，无需修复 |
+
+   2a 的修复方式：拿到 referrer key 后，对 manifest partition 调用 `Exists(key)`；若返回 `false`（key 不在 active generation），视为 stale，回退到完整重建流程，并在重建完成后以新 key 覆写 referrer。2b 无需任何改动，`valid_at` 过期本身已阻断错误路径。
+
 3. **中期**：实现 Path 2（`manifest-ctl transcode` 或等价命令），在 generation rollout 后提供 10×–50× 的更新加速。实现时需对 purge race 做防护：先确认 G1 仍为 non-active（未 purge），再开始 re-encrypt；或在 rollout 后设置一个宽裕的 re-encrypt 窗口，在此窗口内禁止 `purge G1`。
 
 ---
@@ -1752,7 +1770,8 @@ write manifest(key2)     # G2 manifest key
 
 | 路径 | 步骤 | 典型耗时 | 备注 |
 |------|------|---------|------|
-| Path 1 + `--with-referer` | Referrers 命中旧代 key，`Exists` = false → 应回退重建 | — | 当前实现不做 `Exists` 校验，直接返回旧代 key ⚠️ |
+| Path 1 + `--with-referer`，`valid_at` 未过期（2a） | Referrers 命中旧代 key → `valid_at` 通过 → 直接返回 G1 key，不校验 active gen | < 1 s | 当前实现不做 `Exists` 校验，G1 purge 后 key 失效 ⚠️ |
+| Path 1 + `--with-referer`，`valid_at` 已过期（2b） | Referrers 命中旧代 key → `valid_at` 失败 → referer miss，退化为完整重建 | 30–210 s | 行为正确；代价等同无 referer |
 | Path 1（无 referer） | OCI pull + mkfs.erofs + G2 ingest（0% dedup） | 30–210 s | Generation 变化后最差情形 |
 | Path 2（re-encrypt，待实现） | G1 Get + decrypt + G2 re-encrypt + Put（0% dedup，可并发） | 2–8 s | 省去 OCI pull 和 mkfs.erofs，10×–50× 提速 |
 
