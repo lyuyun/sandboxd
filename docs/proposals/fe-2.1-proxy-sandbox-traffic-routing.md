@@ -98,7 +98,13 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 
 **场景**：conductor 重启；proxy worker 维持已建连接（eBPF flowtable 已接管内核转发）；running 沙箱的新连接依赖 proxyshm 路由缓存继续服务；paused 沙箱的 Wake 请求暂时无人应答，等 conductor 重启完成后 proxy master 自动重连并重新同步路由表，Wake 随之恢复。运维人员可无感升级 conductor。
 
-#### 3.1.4 Story D：单 Worker 崩溃后快速恢复
+#### 3.1.4 Story A2：SDK 访问 Running 沙箱的业务端口
+
+作为一个 **SDK 用户**，我想要通过 `<port>-<sid>.<domain>` 访问沙箱内用户进程监听的任意端口（如 Web 服务 :3000、gRPC 接口 :50051），以便于直接使用沙箱内部的自定义服务。
+
+**场景**：沙箱创建成功（state=running），guest 内用户进程监听 PORT；SDK 发起 HTTPS 请求至 cluster-router；cluster-router 按 Host 将请求转发至 proxy worker :8443；proxy worker 解析 Host 得 `(sid, port=PORT)`，查 proxyshm 命中（state=running，FloatingIP=X.X.X.X），校验 `X-Access-Token`，匹配 KindTCP 分支；proxy worker 在 mgmt netns 内 `dial(floatingip:PORT)`，流量经 mg0 → sw-mX TC DNAT（floatingip→inner\_ip）→ bpf\_redirect → sw0-tN tap → CH virtio-net → guest 用户进程；回程经 guest → tap → sw0-tN TC SNAT → sw-mX → mg0 → proxy worker TCP socket；proxy worker 与客户端之间 io.Copy 双向 splice 完成透传。规划阶段 FlowTableWriter 在首包建立后向 transit NIC TC hook 的 map\_flowtable 注册五元组，后续报文在内核路径直通，绕过 proxy worker 用户态。用户感知 100 ms 内的连接建立延迟。
+
+#### 3.1.5 Story D：单 Worker 崩溃后快速恢复
 
 作为一个 **平台运维人员**，我想要 proxy master 在 worker 崩溃时由其余 worker 继续承接新连接，以便于节点数据面具备高可用能力。
 
