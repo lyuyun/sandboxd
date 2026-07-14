@@ -1711,6 +1711,7 @@ mmds:
 
 cluster:
   registry: ""            # 集群 registry 地址；"" = 单节点模式
+  caps: []                # node-link 能力子集（缺省/空 = 全量）；key-only 示例：["key_recv"]
   node_id: ""             # "" = hostname
   data_endpoint: ""       # "" = 同 api.listen
   heartbeat_interval: 10s
@@ -1731,6 +1732,7 @@ manifest_config: /opt/sandbox/manifest.yaml  # remote manifest store 配置
 | MMDS（envd 安全模式）| `mmds.enabled=true` | false |
 | Remote checkpoint | `checkpoint.mode=remote` | local |
 | 集群模式 | `cluster.registry != ""` | 单节点 |
+| node-link key-only 模式 | `cluster.caps: ["key_recv"]` | 全量能力 |
 | 深度休眠（deep-idle）| `checkpoint.deep_idle_sec > 0` | 关闭 |
 | 动态资源控制 | `resource_listen.enabled=true` | 关闭 |
 
@@ -2023,6 +2025,143 @@ guest sandbox-init ──── mem_report (vsock) ────► BalloonContro
 | `node-ctl resource drain [--undrain]` | 切换 drain 模式（拒绝新 admit，不影响已有沙箱）|
 | `node-ctl resource grant <sid> <bytes>` | 强制增加指定沙箱 allocatable（bypass rate limit）|
 | `node-ctl resource reclaim <sid> <target>` | 强制缩减指定沙箱 allocatable（clamp ≥ floor）|
+
+### 4.16 node-link 能力模型（Capability Model）
+
+#### 设计动机
+
+`NodeRegister` 目前隐式绑定全量能力（路由发布 + 心跳 + 命令接收 + key 接收 + 构建事件），server 无法感知某个节点实际支持哪些能力子集。
+
+在需要对接"只分发 manifest key"的轻量上游服务时，该服务无需实现路由同步和生命周期命令，但节点侧无法声明这一意图，导致：① server 可能向该节点推送无法处理的 CmdCreate/Connect；② 节点启动了不必要的路由流和心跳 goroutine，产生无意义上行帧。
+
+本节在 `NodeRegister` 中增加可选能力字段，节点连接时主动声明支持的能力子集，server 据此调整对该节点的处理逻辑。
+
+#### 能力集定义
+
+五个能力按数据流方向和职责划分，命名规则为 `{名词}_{方向}`（`_send` = node → server，`_recv` = server → node）：
+
+| 能力字段 | JSON | 帧 | 方向 |
+|---------|------|-----|------|
+| `RouteSend *NodeRouteSend` | `route_send` | Upsert / Delete / Bookmark | node → server |
+| `Heartbeat *NodeHeartbeat` | `heartbeat` | Heartbeat | node → server |
+| `CmdRecv *NodeCmdRecv` | `cmd_recv` | CmdCreate / CmdConnect / CmdDelete / CmdBuildRegister + CmdAck | server → node |
+| `KeyRecv *NodeKeyRecv` | `key_recv` | CmdKeyPut / CmdKeyDrop + CmdAck | server → node |
+| `EventSend *NodeEventSend` | `event_send` | BuildEvent | node → server |
+
+#### NodeRegister 能力扩展
+
+非 nil 表示该能力激活，nil 表示不支持：
+
+```go
+type NodeRegister struct {
+    NodeID         string            `json:"node_id"`
+    Labels         map[string]string `json:"labels,omitempty"`
+    Capacity       int               `json:"capacity,omitempty"`
+    BuildCapacity  *BuildResources   `json:"build_capacity,omitempty"`
+    DataEndpoint   string            `json:"data_endpoint,omitempty"`
+    RuntimeDigest  string            `json:"runtime_digest,omitempty"`
+    AcceptRedirect bool              `json:"accept_redirect,omitempty"`
+
+    // capability declarations
+    RouteSend *NodeRouteSend `json:"route_send,omitempty"` // 非 nil → 上行 Upsert/Delete/Bookmark
+    Heartbeat *NodeHeartbeat `json:"heartbeat,omitempty"`  // 非 nil → 上行 Heartbeat
+    CmdRecv   *NodeCmdRecv  `json:"cmd_recv,omitempty"`   // 非 nil → 接受 CmdCreate/Connect/Delete/BuildRegister
+    KeyRecv   *NodeKeyRecv  `json:"key_recv,omitempty"`   // 非 nil → 接受 CmdKeyPut/Drop
+    EventSend *NodeEventSend `json:"event_send,omitempty"` // 非 nil → 上行 BuildEvent
+}
+
+type NodeRouteSend struct{} // 预留扩展（如路由过滤条件）
+type NodeHeartbeat struct{} // 预留扩展（如上报间隔协商）
+type NodeCmdRecv   struct{} // 预留扩展（如支持的 Cmd 子集）
+type NodeKeyRecv   struct{} // 预留扩展（如 key 算法偏好）
+type NodeEventSend struct{} // 预留扩展（如 build 事件过滤）
+```
+
+配套 helper 方法，调用方不需要直接检查 nil：
+
+```go
+func (r NodeRegister) sendRoutes() bool    { return r.RouteSend != nil }
+func (r NodeRegister) sendHeartbeat() bool { return r.Heartbeat != nil }
+func (r NodeRegister) recvCmds() bool      { return r.CmdRecv != nil }
+func (r NodeRegister) recvKeys() bool      { return r.KeyRecv != nil }
+func (r NodeRegister) sendEvents() bool    { return r.EventSend != nil }
+```
+
+**向后兼容性**：五个 cap 字段均为空（旧节点未发送）时，server 按全量行为处理（与现有逻辑一致）。
+
+#### 能力与 conductor 配置的对应关系
+
+conductor 根据 `cluster.caps` 决定在 `NodeRegister` 中声明哪些能力（缺省等同全量）：
+
+| 能力 | conductor 行为 |
+|------|--------------|
+| `route_send` | 启动路由流 goroutine（`StreamAuthority` 订阅模式）|
+| `heartbeat` | 启动心跳 goroutine，按 `heartbeat_interval` 周期上报水位 |
+| `cmd_recv` | `onUp` 处理 CmdCreate/Connect/Delete/BuildRegister → HandleCommand |
+| `key_recv` | `onUp` 处理 CmdKeyPut/Drop → HandleCommand（现有路径复用）|
+| `event_send` | 启动 build events goroutine，从 `BuildEvents()` channel 转发至 highOut |
+
+配置示例：
+
+```yaml
+cluster:
+  registry: "https://registry.internal:7070"
+  caps: []  # 缺省/空 = 全量；key-only 示例：["key_recv"]
+  node_id: ""
+  data_endpoint: ""
+  heartbeat_interval: 10s
+  tls_cert: ""
+```
+
+#### key-only 模式
+
+当 `cluster.caps: ["key_recv"]` 时：
+
+- `NodeRegister.RouteSend / Heartbeat / CmdRecv / EventSend` 均为 nil
+- conductor 不启动路由流 goroutine（`reg.subscribes()=false`，进入 `<-sctx.Done()` 分支）
+- conductor 不启动心跳 goroutine（key-only server 不做 placement，水位数据无意义；连接存活由 h2c 流本身保证）
+- conductor 不启动 build events goroutine
+- `onUp` 仍处理所有 TypeCommand 帧，现有 HandleCommand 路径已覆盖 CmdKeyPut/Drop，无需修改
+- server 侧读到 `RouteSend/Heartbeat/CmdRecv/EventSend == nil`，不向该节点分配沙箱或 build 任务，不纳入心跳存活检测
+
+```mermaid
+sequenceDiagram
+    participant N as conductor（caps=["key_recv"]）
+    participant K as key-only server
+
+    N->>K: NodeRegister{NodeID, KeyRecv=&NodeKeyRecv{}}
+    K-->>N: Hello{Version, Policy}
+    Note over N: RouteSend/Heartbeat/CmdRecv/EventSend=nil<br>不启动路由流/心跳/build events goroutine<br>onUp 仍处理 TypeCommand
+
+    loop key 租约（keyLeaseTTL=3h，每 keyRenewBefore=1h 续约）
+        K->>N: Command{Kind=key_put, ManifestKey, ExpiresUnix}
+        N->>N: HandleCommand → st.AddManifestKey(upsert, label="cluster")
+        N-->>K: CmdAck{CmdID, Status=accepted}
+    end
+    opt key 撤销
+        K->>N: Command{Kind=key_drop, KeyFingerprint}
+        N->>N: HandleCommand → dropClusterKey(fingerprint)
+        N-->>K: CmdAck{CmdID, Status=accepted}
+    end
+    Note over N,K: conductor 断连后 key 按 ExpiresUnix 自然到期
+```
+
+#### server 侧行为
+
+server 读取 NodeRegister 后按能力字段调整对该节点的处理：
+
+| NodeRegister 字段 | server 行为 |
+|-------------------|-----------|
+| `RouteSend != nil` | 向该节点发起路由订阅，分配 outbox，推送路由增量 |
+| `RouteSend == nil` | 不期望 Upsert/Delete/Bookmark 上行帧 |
+| `Heartbeat != nil` | 纳入存活检测；期望周期性 Heartbeat 上行帧 |
+| `Heartbeat == nil` | 不纳入心跳存活检测 |
+| `CmdRecv != nil` | 可向该节点发 CmdCreate / CmdConnect / CmdDelete / CmdBuildRegister |
+| `CmdRecv == nil` | 不向该节点分配沙箱或 build 任务 |
+| `KeyRecv != nil` | 将该节点纳入 key 分配集（reconcileKeys 的 allocationSet 计算）|
+| `KeyRecv == nil` | 不向该节点发 CmdKeyPut/Drop |
+| `EventSend != nil` | 期望 BuildEvent 上行帧；converge BuildStore |
+| `EventSend == nil` | 不期望 BuildEvent 上行帧 |
 
 ---
 
