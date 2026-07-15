@@ -1197,6 +1197,155 @@ envd（guest 内）                         proxy MMDS server
      │ envd re-key 完成，后续 RPC 验 token
 ```
 
+### 4.7.1 用户凭据扩展设计（规划）
+
+#### 需求
+
+系统（conductor / 业务 API）在 sandbox 运行期间向其注入凭据（任意 JSON），sandbox 内的用户业务进程通过 MMDS 读取，无需修改 guest 镜像或经由 envd 中转。
+
+#### 架构约束
+
+- **proxyshm 定长 mmap**：每条记录字段均为固定大小 `[N]byte`，无法存储任意大小的凭据 blob，凭据必须走独立存储路径。
+- **worker 重启透明性依赖 proxyshm 共享可见**：现有路由数据存在 proxyshm，新 worker 启动后直接 mmap 即可读取，无需 master 重放。凭据若存于进程内存，新 worker 启动时 credStore 为空，需要额外的重放机制，否则与现有路由的无感知恢复不对称。
+- **MMDS session token 绑定 floatingIP → sandboxID**：现有 HMAC 鉴权已证明调用方身份，可直接复用。
+- **凭据写侧权威**：guest 进程经 tap → vswitch → mg0 → mmdsLn 到达 MMDS server，整条路径不能反向触达 master 的 credStore；host 侧写入权威必须与现有路由权威模型（conductor → routesync → master）保持一致或明确收窄。
+
+#### 方案对比
+
+##### 方案 A：proxy master 新增 admin 端点
+
+```
+[业务系统 / conductor]
+      │  PUT /sandbox/{sid}/user-data  (HTTP，admin UDS，root ns)
+      ▼
+[proxy master]
+  credStore: sync.Map[sid → json.RawMessage]
+      │  credFD pipe（每 worker 一条，[4B len][json(CredentialEntry)] 帧）
+      │  新 worker 启动时需全量重放当前 credStore
+      ▼
+[proxy worker]
+  credStore: sync.Map（从 credFD 读帧填充）
+      ▼
+[MMDS]  GET /latest/user-data + X-metadata-token
+      ▼
+[guest 业务进程]
+```
+
+proxy master 新增一个 `AdminListen`（UDS，root ns，`0600` 权限），接受凭据写入请求。master 更新本地 credStore，通过 per-worker credFD pipe 推送 `CredentialEntry{sid, payload}` 帧给所有 worker，worker 维护各自的本地 credStore。
+
+**优点**：不需要修改 routesync 协议；conductor 无需感知凭据概念；延迟低，一次 UDS 调用即可。
+
+**缺点（可靠性）**：
+- **master 崩溃时凭据永久丢失**：credStore 仅在 master 内存，master 崩溃后 conductor 无法重推，破坏了"master 重启后数据面自动恢复"的现有边界；业务系统必须在 proxy 重启后重新 PUT 所有凭据，这是与路由恢复行为不对称的。
+- **worker 崩溃时需 master 主动重放**：新 worker 启动时 credStore 为空，master 须在 `cmd.Start()` 后、`cmd.Wait()` 前通过 credFD 发送全量快照，并处理与并发增量更新的排序，实现比现有 proxyshm 模式复杂。
+
+**缺点（安全）**：admin UDS 绕过了 conductor 作为写入权威的现有链路（conductor → routesync → master），任何宿主机上的 root 进程均可直接向任意 sandbox 注入凭据，不经过 conductor 的访问控制。
+
+##### 方案 B：通过 routesync 下发（TypeCredential）
+
+```
+[conductor]
+      │  routesync 流：TypeCredential 帧（h2c stream，与 Upsert/Delete 同路）
+      ▼
+[proxy master subscriber]
+  MasterView.ApplyCredential()
+  credStore + credBC（CredBroadcaster）
+      │  credFD pipe → workers（含新 worker 启动时全量重放）
+      ▼
+[proxy worker]  credStore
+      ▼
+[MMDS]  GET /latest/user-data
+```
+
+新增 routesync 消息类型：
+
+```go
+const TypeCredential = "credential"
+
+type CredentialEntry struct {
+    SandboxID string          `json:"sid"`
+    Payload   json.RawMessage `json:"payload,omitempty"` // nil = 清除
+}
+```
+
+conductor 持久化凭据（DB），proxy master 重连时 conductor 重推所有 TypeCredential 帧，与路由重放对称。
+
+**优点**：master 崩溃后凭据随 routesync 重连自动恢复，与路由恢复行为完全对称，不破坏现有可靠性边界；写入权威保持在 conductor，不扩展安全面。
+
+**缺点**：需扩展 routesync 协议；conductor 必须新增凭据持久化（数据库），引入额外的 conductor 职责和存储依赖；worker 崩溃时的全量重放仍需实现（与方案 A 相同）。
+
+#### 两方案共有的 worker 重启缺口
+
+无论选哪种方案，worker 单独崩溃时都面临同一个问题：
+
+```
+新 worker 启动（runProxyWorkerProcess）
+  → cmd.Start() 在 mgmt ns 中 fork
+  → 新 credFD pipe 建立
+  → worker 进程 credStore 初始为空
+  → 若不做重放，GET /latest/user-data 对所有 sandbox 返回 404
+```
+
+解决方案：master 在 `cmd.Start()` 成功后、`cmd.Wait()` 开始前，通过新 worker 的 credFD 推送当前 credStore 的全量快照（加排他锁或版本号防止与并发写乱序）。这是现有 proxyshm 模式中不存在的额外复杂度，两种方案都需要实现。
+
+#### 方案选择建议
+
+| 维度 | 方案 A（admin 端点） | 方案 B（routesync） |
+|------|---------------------|---------------------|
+| 改动范围 | proxy master + worker + mmds | routesync proto + conductor + master + worker + mmds |
+| conductor 重启 | 凭据不受影响（master 内存存活） | 凭据随路由自动重放恢复 |
+| master 崩溃恢复 | **凭据永久丢失，需外部重推** | 自动恢复（需 conductor 持久化） |
+| worker 崩溃恢复 | 需 master 重放全量（两方案同） | 同左 |
+| 写入权威 | 绕过 conductor，root 进程可直接写 | 保持 conductor 权威链 |
+| 适用场景 | 凭据生命周期与 proxy 进程解耦可接受 | 要求与路由同等可靠性保证 |
+
+**选择依据**：若业务系统能在 proxy 重启事件后主动重推凭据（有健壮的 proxy 重启通知和重推机制），方案 A 实现最简；若要求凭据恢复与路由恢复同等透明、不引入外部重推依赖，选方案 B，但需同步在 conductor 侧增加凭据持久化。
+
+#### MMDS 端点扩展（两方案共用）
+
+无论哪种写入路径，读侧设计相同：
+
+**mmds.Source 接口新增方法**
+
+```go
+type Source interface {
+    ByFloatingIP(ip string) (sandboxID string, ok bool)
+    SandboxInfo(sandboxID string) (templateID, accessToken string, ok bool)
+    MmdsSecret(sandboxID string) (secret []byte, ok bool)
+    UserData(sandboxID string) (data json.RawMessage, ok bool) // 新增
+}
+```
+
+**新端点 `GET /latest/user-data`**
+
+```
+guest 业务进程                           proxy MMDS server
+     │ PUT /latest/api/token              │
+     ├───────────────────────────────────►│  （现有流程，获取 session token）
+     │◄─── token ─────────────────────────┤
+     │ GET /latest/user-data              │
+     │   X-metadata-token: <token>        │
+     ├───────────────────────────────────►│
+     │                                    │  verifyToken → sid
+     │                                    │  WorkerView.UserData(sid)
+     │◄─── {credentials JSON} ────────────┤
+```
+
+- 未设置凭据时返回 404。
+- token 验证失败（过期、伪造）返回 401。
+- 凭据内容对 MMDS server 透明（raw JSON）。
+
+#### 可靠性与安全边界分析
+
+| 场景 | 方案 A | 方案 B |
+|------|--------|--------|
+| conductor 重启 | ✅ 凭据在 master 内存，不受影响 | ✅ 随路由全量重放自动恢复 |
+| worker 单独崩溃 | ⚠️ 需 master 启动时重放全量（两方案同） | ⚠️ 同左 |
+| master 崩溃 | ❌ 凭据永久丢失，破坏自动恢复边界 | ✅ 随 routesync 重连自动恢复 |
+| 写入权威 | ⚠️ 绕过 conductor，root 进程可直接注入 | ✅ conductor 权威链完整保留 |
+| 读侧隔离 | ✅ HMAC token 绑定 floatingIP → sid | ✅ 同左 |
+| sandbox 间隔离 | ✅ token 与 sid 绑定，不同 sandbox 不通用 | ✅ 同左 |
+
 ### 4.8 API 设计
 
 #### 4.8.1 对外 API 变更（proxy 数据面入口）
