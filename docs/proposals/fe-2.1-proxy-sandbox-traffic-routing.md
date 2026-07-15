@@ -46,7 +46,6 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 | D-1 | proxy worker 进程框架 | `node-ctl proxy` 子命令，SO_REUSEPORT TLS 监听，多实例 |
 | D-2 | routesync 客户端 | config-socket plugin 平面订阅者，全量 + 增量路由同步 |
 | D-3 | 路由表 + 流量分发 | proxyshm seqlock hash O(1) 查表，按端口分发至 UDS/floatingip |
-| D-4 | eBPF flowtable 集成 | 新建连接注册 flowtable，已建连接内核 TC hook 直通 |
 | D-5 | park/wake 机制 | paused 沙箱 park 队列 + wake 上行帧 + 超时 404 |
 | D-6 | MMDS v2 sidecar | 内嵌 MMDS HTTP，deterministic mmds_secret 验证 |
 | D-7 | Token 鉴权 | off/log/enforce 三档，envdsign.CheckDataPlaneAuth |
@@ -57,14 +56,14 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 
 | 维度 | E2B（参照系）| agent-substrate（Google）| kuasar-sandbox（本设计）|
 |------|------------|------------------------|----------------------|
-| 数据面实现 | Linux bridge + iptables L4 | Envoy sidecar L7 用户态代理 | eBPF/TC 内核态转发 + proxy worker L7 终止 |
-| 控制面故障影响数据面 | 有（iptables 规则随进程维护）| 有（Envoy 依赖控制面下发配置）| **无**（bpffs pin，flowtable 独立于控制面）|
+| 数据面实现 | Linux bridge + iptables L4 | Envoy sidecar L7 用户态代理 | proxy worker L7 TLS 终止 + vswitch TC DNAT 内核路由 |
+| 控制面故障影响数据面 | 有（iptables 规则随进程维护）| 有（Envoy 依赖控制面下发配置）| **无**（proxyshm 缓存，proxy worker 独立于 conductor 生命周期）|
 | Paused 沙箱透明恢复 | ❌ 客户端需感知并重试 | ❌ 无 pause 概念 | ✅ server-side park/wake |
 | 路由查表复杂度 | O(n) iptables 规则匹配 | DNS pull + Envoy xDS | **O(1)** proxyshm seqlock hash（外置 mmap）|
 | 多进程水平扩展 | 单进程 | 单 sidecar per pod | **SO_REUSEPORT 多 worker，独立故障域** |
 | MMDS/元数据安全下发 | ❌ 无 | △ 依赖 K8s ConfigMap | ✅ HMAC 确定性密钥，不落明文 |
 
-**核心竞争优势**：eBPF flowtable 接管已建连接后，宿主机上的转发路径完全绕过用户态 proxy worker，吞吐量接近线速；同时 conductor 崩溃不中断数据面，这是 E2B 和 agent-substrate 均未解决的问题。
+**核心竞争优势**：conductor 崩溃不中断数据面（proxyshm 缓存 + proxy worker 独立进程），这是 E2B 和 agent-substrate 均未解决的问题。
 
 ### 2.4 需求约束
 
@@ -84,7 +83,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 
 作为一个 **SDK 用户**，我想要通过 `<49983-sid.domain>` 发起 Connect RPC 调用，以便于在运行中的沙箱内执行代码和文件操作。
 
-**场景**：沙箱创建成功（state=running），SDK 持有 `EnvdAccessToken`，发起 HTTPS 请求至 cluster-router；cluster-router 按 Host 将请求转发至 proxy worker :8443；proxy worker 解析 Host 得 `(sid, port=49983)`，查 proxyshm 命中，校验 `X-Access-Token`，将连接路由至 envd UDS，后续流量经 eBPF flowtable 内核直通。用户感知到 100 ms 内的连接建立延迟。
+**场景**：沙箱创建成功（state=running），SDK 持有 `EnvdAccessToken`，发起 HTTPS 请求至 cluster-router；cluster-router 按 Host 将请求转发至 proxy worker :8443；proxy worker 解析 Host 得 `(sid, port=49983)`，查 proxyshm 命中，校验 `X-Access-Token`，匹配 KindUDS 分支；proxy worker dial forwardLn UDS → Forwarder（sandbox-ctl 持有）→ vsock → CH virtio-vsock → sandbox-init → envd :49983，全程用户态 io.Copy 双向 splice 透传。用户感知到 100 ms 内的连接建立延迟。
 
 #### 3.1.2 Story B：流量触发 Paused 沙箱自动恢复
 
@@ -96,13 +95,13 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 
 作为一个 **平台运维人员**，我想要重启 node-ctl conductor 进程（升级/配置变更），以便于不影响用户已建立的沙箱连接。
 
-**场景**：conductor 重启；proxy worker 维持已建连接（eBPF flowtable 已接管内核转发）；running 沙箱的新连接依赖 proxyshm 路由缓存继续服务；paused 沙箱的 Wake 请求暂时无人应答，等 conductor 重启完成后 proxy master 自动重连并重新同步路由表，Wake 随之恢复。运维人员可无感升级 conductor。
+**场景**：conductor 重启；proxy worker 维持已建连接；running 沙箱的新连接依赖 proxyshm 路由缓存继续服务；paused 沙箱的 Wake 请求暂时无人应答，等 conductor 重启完成后 proxy master 自动重连并重新同步路由表，Wake 随之恢复。运维人员可无感升级 conductor。
 
 #### 3.1.4 Story A2：SDK 访问 Running 沙箱的业务端口
 
 作为一个 **SDK 用户**，我想要通过 `<port>-<sid>.<domain>` 访问沙箱内用户进程监听的任意端口（如 Web 服务 :3000、gRPC 接口 :50051），以便于直接使用沙箱内部的自定义服务。
 
-**场景**：沙箱创建成功（state=running），guest 内用户进程监听 PORT；SDK 发起 HTTPS 请求至 cluster-router；cluster-router 按 Host 将请求转发至 proxy worker :8443；proxy worker 解析 Host 得 `(sid, port=PORT)`，查 proxyshm 命中（state=running，FloatingIP=X.X.X.X），校验 `X-Access-Token`，匹配 KindTCP 分支；proxy worker 在 mgmt netns 内 `dial(floatingip:PORT)`，流量经 mg0 → sw-mX TC DNAT（floatingip→inner\_ip）→ bpf\_redirect → sw0-tN tap → CH virtio-net → guest 用户进程；回程经 guest → tap → sw0-tN TC SNAT → sw-mX → mg0 → proxy worker TCP socket；proxy worker 与客户端之间 io.Copy 双向 splice 完成透传。规划阶段 FlowTableWriter 在首包建立后向 transit NIC TC hook 的 map\_flowtable 注册五元组，后续报文在内核路径直通，绕过 proxy worker 用户态。用户感知 100 ms 内的连接建立延迟。
+**场景**：沙箱创建成功（state=running），guest 内用户进程监听 PORT；SDK 发起 HTTPS 请求至 cluster-router；cluster-router 按 Host 将请求转发至 proxy worker :8443；proxy worker 解析 Host 得 `(sid, port=PORT)`，查 proxyshm 命中（state=running，FloatingIP=X.X.X.X），校验 `X-Access-Token`，匹配 KindTCP 分支；proxy worker 在 mgmt netns 内 `dial(floatingip:PORT)`，流量经 mg0 → sw-mX TC DNAT（floatingip→inner\_ip）→ bpf\_redirect → sw0-tN tap → CH virtio-net → guest 用户进程；回程经 guest → tap → sw0-tN TC SNAT → sw-mX → mg0 → proxy worker TCP socket；proxy worker 与客户端之间 io.Copy 双向 splice 完成透传。用户感知 100 ms 内的连接建立延迟。
 
 #### 3.1.5 Story D：单 Worker 崩溃后快速恢复
 
@@ -116,7 +115,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 
 - **新增进程**：`proxy master + worker × K`（external 模式）；internal 模式由 conductor 进程内嵌，off 模式不启动。
 - **新增接口**：config-socket plugin 平面的 routesync 帧协议（h2c + 4B LE + JSON），conductor 侧同步新增实现。
-- **技术选型**：Go 标准库 `net/http` + `crypto/tls`；eBPF flowtable 操作复用 sandbox-vswitch 已 pin 的 BPF map（`/sys/fs/bpf/vswitch/map_flowtable`），不新增 BPF 程序。
+- **技术选型**：Go 标准库 `net/http` + `crypto/tls`。
 - **特性树影响**：本特性是沙箱生命周期的必要前提——无 proxy 则沙箱创建成功但不可访问；两者并行开发，proxy 可以 `proxy.mode=off` 模式先行合入。
 
 ### 3.3 功能规格
@@ -130,7 +129,6 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 | 路由查表复杂度 | O(1)（proxyshm seqlock hash）|
 | park 队列上限（per-sid）| 无硬上限，受 park_timeout 时间窗约束 |
 | 路由表事件通道缓冲 | 1024 帧/subscriber |
-| eBPF flowtable 条目上限 | 与 sandbox-vswitch 共享，参见 vswitch 设计 |
 | OS 版本要求 | Linux kernel ≥ 5.15（BPF_MAP_TYPE_LRU_HASH） |
 | TLS 最低版本 | TLS 1.2（建议 1.3） |
 
@@ -143,9 +141,6 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 | Secure 模式 | 协作：mmds.enabled=true 时 proxy 内嵌 MMDS；conductor 生成 mmds_secret 经 routesync 下发 | MMDS sidecar 须与 proxy worker 同进程 |
 | 网络基础设施（vswitch）| 依赖：floatingip 由 connector-ctl vswitch attach 分配后才写入 RouteEntry | vswitch 须先于 proxy 就绪 |
 
-| 规划特性（未实现）| 关系 | 约束 |
-|----------------|------|------|
-| 高性能数据面（eBPF flowtable）| 协作：proxy 新建连接后注册 flowtable，后续由 TC hook 内核转发（当前全程用户态 splice）| bpffs 须挂载于 /sys/fs/bpf |
 
 ### 3.4 风险及设计约束
 
@@ -153,7 +148,6 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 |------|------|---------|
 | conductor 重启期间 paused 沙箱 wake 无人应答 | park 超时后用户请求 404 | park_timeout 默认 30 s，conductor 重启 < 5 s；告警 conductor 重启时间异常 |
 | proxy worker 订阅通道积压（> 1024 帧）| subscriber 被丢弃，需全量重同步 | 指数退避重连；监控 `proxy_routesync_reconnect_total` |
-| bpffs 未挂载或 flowtable map 不存在 **[flowtable 实现后生效]** | proxy 降级为纯用户态转发（仍可用，但内核旁路不生效）| 启动时检查 `/sys/fs/bpf/vswitch/map_flowtable`，缺失则 warn 并降级 |
 | TLS 证书更新期间短暂服务中断 | 新建 TLS 握手失败 | 双 worker 滚动重启：先重启 worker-1，再重启 worker-2 |
 | park 队列 goroutine 泄漏（sid 永不 resume）| 内存缓慢增长 | park_timeout 超时后强制释放所有 goroutine；Dead 路由删除时同步清队列 |
 
@@ -165,7 +159,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 |------|------|---------|
 | 纯 iptables/nftables DNAT | 不需要 proxy 进程，直接在宿主机规则链转发 | 规则随沙箱密度线性膨胀；控制面重启时规则管理复杂；无 park/wake 能力 |
 | Envoy xDS proxy | 复用成熟代理组件 | 引入 C++ 依赖；xDS 协议替换 routesync 增加集成成本；MMDS 无法内嵌 |
-| 用户态纯 splice（不集成 eBPF）| 实现简单 | 当前即为此方案；高并发下每个报文均需用户态往返，吞吐受限；叠加 eBPF flowtable 后此方案退化为首包处理 + 回退模式 |
+| 用户态纯 splice（当前方案）| 实现简单 | 当前即为此方案；高并发下每个报文均需用户态往返，吞吐受限于 proxy worker io.Copy goroutine |
 
 ---
 
@@ -216,7 +210,7 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  ┌─ config-socket (UDS, h2c, 4 planes) ──────────────────┐       │  │  │   e2b + 49983/49999 → KindUDS splice                     │    │  │
 │  │  │ /run/sandbox/node-ctl.socket                          │       │  │  │   bare + 49983/49999 → KindDeny → 501                    │    │  │
 │  │  │ task  plane ◄── sandbox-ctl (SO_PEERCRED)            │       │  │  │   any  + other       → KindTCP via mg0→sw-mX            │    │  │
-│  │  │  POST /internal/task/launchspec                       │       │  │  │                         [FlowTableWriter 计划中]         │    │  │
+│  │  │  POST /internal/task/launchspec                       │       │  │  │                                                          │    │  │
 │  │  │ admin plane ◄── node-ctl CLI                         │       │  │  │   paused → park + wake pipe ──► master                  │    │  │
 │  │  │  /internal/admin/*  (manifest-key 等)                │       │  │  │   KindNotFound → 404                                     │    │  │
 │  │  │                                                       │       │  │  │ MMDS v2（mmds fd 继承, 127.0.0.1:19254）                 │    │  │
@@ -289,7 +283,6 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  │  │    入向: proxy worker dial(floatingip:PORT) → mg0(mgmt netns) → sw-mX(switch netns)         │    │  │   │
 │  │  │  │           → TC DNAT → bpf_redirect → sw0-tN tap → CH → guest                               │    │  │   │
 │  │  │  │    回程: guest → CH → tap → sw0-tN TC SNAT → sw-mX → mg0 → proxy worker TCP socket         │    │  │   │
-│  │  │  │    规划: transit NIC TC flowtable 命中 → 绕过 proxy worker 直通 → guest                    │    │  │   │
 │  │  │  │  MMDS: 169.254.169.254:80 ──(vswitch DNAT)──► 127.0.0.1:19254 (proxy MMDS, mgmt netns)    │    │  │   │
 │  │  │  │  DNS:  169.254.169.253:53 ──(vswitch DNAT)──► 127.0.0.1:19253 (CoreDNS)                   │    │  │   │
 │  │  │  │  出站: guest NIC → CH tap → vswitch TC eBPF(GENEVE) → transit NIC → 外部网关               │    │  │   │
@@ -317,13 +310,6 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  ┌─ Linux 内核 ────────────────────────────────────────────────────────────────────────────────────────────  ┐   │
 │  │  bpffs  /sys/fs/bpf/vswitch/                                                                             │   │
 │  │  ├─ prog_tc_ingress / prog_tc_egress   TC hook, attach on transit NIC (eth1)                            │   │
-│  │  │                                                                                                       │   │
-│  │  ├─ map_flowtable   BPF_MAP_TYPE_LRU_HASH  [计划中，未实现]                                             │   │
-│  │  │    key:  {src_ip, src_port, dst_ip, dst_port} (网络字节序)                                            │   │
-│  │  │    val:  {floatingip, port}                                                                           │   │
-│  │  │    ↑ proxy worker FlowTableWriter  bpf_map_update_elem  (新建 TCP 连接后写入) [未实现]               │   │
-│  │  │    ↑ proxy worker              bpf_map_delete_elem  (连接关闭后清理)      [未实现]                   │   │
-│  │  │    ← TC hook 读取: 已建连接在内核路径直接转发, 报文不再经过 proxy worker 用户态 [未实现]               │   │
 │  │  │                                                                                                       │   │
 │  │  ├─ map_conntrack   SYNACK / ESTABLISHED / CLOSING  (连接状态追踪)                                       │   │
 │  │  └─ map_egress_policy / map_egress_allow_lpm / map_egress_deny_lpm  (出站策略)              │   │
@@ -397,7 +383,6 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │     │                                                                                    │  │  │
 │  │     │  KindTCP  (any + other port)                                                        │  │  │
 │  │     │    dial TCP(entry.FloatingIP:port) via mg0 → sw-mX → guest                         │  │  │
-│  │     │    FlowTableWriter.Register / .Remove [bpffs，计划中]                               │  │  │
 │  │     │    io.Copy 双向 splice                                                               │  │  │
 │  │     │                                                                                    │  │  │
 │  │     │  state=paused                                                                      │  │  │
@@ -421,10 +406,10 @@ Kuasar Sandbox 平台的沙箱（microVM）需要通过 HTTPS 向外暴露 envd 
 │  │  goroutine: MetricsServer  (HTTP  127.0.0.1:9090)  GET /metrics → Prometheus text format     │  │
 │  └──────────────────────────────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────┘
-        │ UDS splice (forwardLn)   │ TCP splice via mg0   │ bpffs               │ wake pipe → master
-        ▼                         ▼                      ▼                    ▼        → routesync
-  envd.sock / ci.sock       floatingip:PORT        /sys/fs/bpf/vswitch/  /run/sandbox/node-ctl.socket
-  (host UDS, sandbox-ctl    (mg0→sw-mX→tap→CH)    map_flowtable          (conductor plugin plane)
+        │ UDS splice (forwardLn)   │ TCP splice via mg0   │ wake pipe → master
+        ▼                         ▼                    ▼        → routesync
+  envd.sock / ci.sock       floatingip:PORT        /run/sandbox/node-ctl.socket
+  (host UDS, sandbox-ctl    (mg0→sw-mX→tap→CH)    (conductor plugin plane)
    Forwarder 持有)
 ```
 
@@ -530,7 +515,6 @@ conductor(node-ctl.service)   proxy master              proxy worker × K       
         │                   │                                 │                  │ TCP 连接建立
         │◄─────────────────────────────────────────────────────────────────────── │
         │    TCP splice（proxy worker ↔ mg0 ↔ sw-mX ↔ tap ↔ CH ↔ guest）
-        │    规划: transit NIC TC hook flowtable 命中 → 内核直通，绕过 proxy worker
 ```
 
 #### 4.0.4 关键 IPC 通道一览
@@ -556,8 +540,7 @@ conductor(node-ctl.service)   proxy master              proxy worker × K       
 |------|------|------|---------|---------|
 | envd.sock / ci.sock | UDS (AF_UNIX stream) | `/run/sandbox/<sid>/envd.sock` | proxy worker → Forwarder（vsock 反向通道入口）| — (上层 token 鉴权) |
 | vsock.sock | UDS (AF_UNIX stream) | `/run/sandbox/<sid>/vsock.sock` | Forwarder → CH virtio-vsock（层1 CONNECT + 层2 TypeConnect）| — (host-only socket) |
-| floatingip:PORT | TCP | sandbox floatingip:PORT | **入向**（当前）proxy worker → mg0(mgmt netns) → sw-mX(switch netns) TC DNAT → bpf_redirect → sw0-tN tap → CH → guest；**回程**（当前）guest → tap → sw0-tN TC SNAT → sw-mX → mg0 → proxy worker TCP socket；**规划**：transit NIC TC hook flowtable 命中 → 绕过 proxy worker 内核直通 | envdsign.CheckDataPlaneAuth (proxy 层) |
-| bpffs map_flowtable **[计划中，未实现]** | 内核 BPF map | `/sys/fs/bpf/vswitch/map_flowtable` | proxy worker 写 / TC hook 读（transit NIC 双向命中） | CAP_SYS_ADMIN (root only) |
+| floatingip:PORT | TCP | sandbox floatingip:PORT | **入向** proxy worker → mg0(mgmt netns) → sw-mX(switch netns) TC DNAT → bpf_redirect → sw0-tN tap → CH → guest；**回程** guest → tap → sw0-tN TC SNAT → sw-mX → mg0 → proxy worker TCP socket；全程用户态 io.Copy splice | envdsign.CheckDataPlaneAuth (proxy 层) |
 | MMDS v2 HTTP | HTTP/1.1 loopback | `127.0.0.1:19254` (mgmt netns) | guest envd → proxy worker（经 vswitch DNAT, mgmt netns）| MMDS session token |
 
 #### 4.0.5 proxy.mode=internal 进程拓扑差异
@@ -651,7 +634,6 @@ node-ctl.service
         ✗  Dispatcher / ParkQueue       ← 不构建
         ✗  MMDS v2 server               ← 不启动
         ✗  RouteSyncClient / routesync  ← 不构建（plugin 平面只监听，不推）
-        ✗  FlowTableWriter / bpffs 写入 ← 不执行
 
 无外部入站流量路径
 ```
@@ -663,7 +645,6 @@ node-ctl.service
 | 数据面监听 :8443 | proxy worker × K（mgmt netns）| conductor 内嵌 | **无** |
 | routesync 推送 | 有（conductor → proxy master → proxyshm）| 有（in-process）| **无**（plugin 平面保持监听但不推）|
 | MMDS v2 server | proxy worker 进程内（mgmt netns）| conductor 进程内 | **不启动** |
-| eBPF flowtable 写入 | 有 | 有 | **无** |
 | 沙箱生命周期管理 | 正常 | 正常 | **正常**（控制面完整） |
 | 外部流量可达性 | 可达 | 可达 | **不可达**（无数据面） |
 | `data_requests_total` | 计数 | 计数 | `result="off"` 计数（如有请求打到控制面 :443） |
@@ -752,9 +733,6 @@ node-ctl.service
 │  └───────────────────────────────────────────────────────────────────── ┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 
-  eBPF flowtable（/sys/fs/bpf/vswitch/）[计划中，未实现]
-  {src_ip,src_port,dst_ip,dst_port} → {floatingip,port}
-  TC hook 内核直通（已建连接绕过 proxy 用户态）
 ```
 
 **internal 模式对比**（`proxy.mode=internal`）：conductor（`node-ctl conductor serve`）进程内嵌 `proxy.NewWithDialer`，以 `Orchestrator` 路由视图直接解析路由，无 master/worker 进程、无 proxyshm；TCP 拨号可通过 `proxy_netns` 在指定 netns 内发起。external 模式下 conductor 的数据面入口退化为 `proxyForwarder`，将请求经 UDS（`proxy_socket`）转给已注册的 proxy master。
@@ -784,7 +762,6 @@ node-ctl.service
 | `RouteForTarget` / `Dispatcher` | 按 profile × port 决策：e2b 49983/49999 → KindUDS（dial forwardLn EnvdUDS/CiUDS）；bare 49983/49999 → KindDeny → 501；其他端口 → KindTCP（dial FloatingIP:port via mg0）|
 | `ParkQueue` | paused 状态下 park 当前 conn；同时写 wake pipe → master；notify pipe 触发 UnparkAll；park_timeout → Cancel → 503 |
 | `MMDSServer` | 继承 mmdsLn fd（`127.0.0.1:19254`，mgmt netns）；`PUT /latest/api/token` → `sid.hex(HMAC-SHA256(mmds_secret, sid))`；`GET /` → `{instanceID, envID, accessTokenHash: hex(sha512(token))}`；token 确定性，每个 worker 独立可验 |
-| `FlowTableWriter` | **[计划中]** KindTCP 建连后写 eBPF flowtable（`bpf_map_update_elem`）；连接关闭后清理 |
 | `MetricsServer` | Prometheus `/metrics` |
 
 **envd.sock / ci.sock 的本质：vsock 反向通道转发器**
@@ -891,9 +868,7 @@ vsock 通道建立后，Forwarder 发送应用层帧 `TypeConnect{Network:"tcp",
 
 **用户端口（port ≠ 49983/49999）端到端数据面完整路径：**
 
-用户端口走 TCP splice。当前实现中 proxy worker 全程承运（KindTCP → `io.Copy` 双向 splice）。eBPF flowtable 加速尚未实现，以下阶段二为设计规格。
-
-阶段一：经过 proxy worker 用户态（当前实现）
+用户端口走 TCP splice，KindTCP → proxy worker `io.Copy` 双向 splice。
 
 ```
 客户端 SDK  (HTTPS / TCP)
@@ -930,57 +905,21 @@ guest 网卡 (virtio-net)  [guest netns]
   ▼
 用户 app  [guest 内，监听 :PORT]
 
-← 当前入向：客户端 → proxy worker（io.Copy splice）→ mg0 → veth → sw-mX DNAT → tap → CH virtio-net → guest
-← 当前回程：guest → CH virtio-net → tap → sw0-tN TC SNAT(inner_ip→floatingIP) → sw-mX → mg0 → proxy worker TCP socket
-← 规划入向：transit NIC TC hook flowtable 命中，改写 dst→floatingIP → mg0 → sw-mX DNAT → tap → guest（绕过 proxy worker）
-← 规划回程：guest → tap → sw0-tN SNAT → mg0 → transit NIC TC hook flowtable 反向命中，改写 src→nodeIP → client
+← 入向：客户端 → proxy worker（io.Copy splice）→ mg0 → veth → sw-mX DNAT → tap → CH virtio-net → guest
+← 回程：guest → CH virtio-net → tap → sw0-tN TC SNAT(inner_ip→floatingIP) → sw-mX → mg0 → proxy worker TCP socket
 ```
 
-阶段二：flowtable 写入后，TC hook 内核直通（绕过 proxy worker）【计划中】
-
-```
-客户端后续数据包  (已建连接)
-  │
-  ▼
-transit NIC (eth1)  [TC hook: prog_tc_ingress]
-  │  bpf_map_lookup_elem(map_flowtable, {src,sport,dst,dport}) → 命中
-  │  内核改写 dst → FloatingIP:PORT；proxy worker 用户态 splice 循环退出
-  ▼
-mg0  [mgmt veth peer，mgmt netns (sw0_mgmt)]
-  │  内核路由：floatingIP/20 → mg0（flowtable 改写后命中此路由）
-  │  veth pair
-  ▼
-sw-mX  [switch netns]
-  │  TC DNAT(floatingIP→inner_ip) → bpf_redirect → sw0-tN tap
-  ▼
-CH virtio-net backend → virtio-net virtqueue → guest 用户 app
-
-回程（guest → client，内核直通）:
-guest 用户 app → CH virtio-net → tap → sw0-tN
-  → TC SNAT(inner_ip→floatingIP) → sw-mX → mg0 → host kernel
-  ▼
-transit NIC (eth1)  [TC hook: prog_tc_ingress，反向]
-  │  bpf_map_lookup_elem(map_flowtable, {src=floatingIP,sport,...}) → 命中
-  │  改写 src FloatingIP → nodeIP（还原为客户端所见的节点地址）
-  ▼
-client
-
-← 规划入向：transit NIC TC hook flowtable 命中，改写 dst→floatingIP → mg0 → sw-mX DNAT → tap → guest（绕过 proxy worker）
-← 规划回程：guest → tap → sw0-tN SNAT → mg0 → transit NIC TC hook flowtable 反向命中，改写 src→nodeIP → client
-← 双向均绕过 proxy worker 用户态，吞吐量接近线速
-```
-
-连接关闭时，proxy worker 保留一个轻量 goroutine 监听 FIN/RST，收到后执行 `bpf_map_delete_elem` 清理 flowtable 条目，防止 4 元组复用时命中过期条目。**[flowtable 实现后生效；当前无 flowtable，连接关闭仅回收 io.Copy goroutine]**
+连接关闭时，proxy worker 的 io.Copy goroutine 退出，OS 回收两侧 socket 及 TCP 状态。
 
 与 envd/ci 路径的关键差异：
 
 | 维度 | envd/ci（port 49983/49999） | 用户端口（其他 port） |
 |------|----------------------------|----------------------|
-| 转发层 | UDS → vsock（始终经过 sandbox-ctl） | TCP → mg0 → sw-mX TC DNAT → tap（当前全程经过 proxy worker；flowtable 实现后首包经 proxy worker，后续 transit NIC flowtable 内核直通）|
-| 数据路径中的进程 | proxy worker + sandbox-ctl（全程字节 relay） | 当前：proxy worker 全程 io.Copy；flowtable 实现后：首包经 proxy worker，后续绕过所有用户态 |
+| 转发层 | UDS → vsock（始终经过 sandbox-ctl） | TCP → mg0 → sw-mX TC DNAT → tap（全程经过 proxy worker io.Copy splice）|
+| 数据路径中的进程 | proxy worker + sandbox-ctl（全程字节 relay） | proxy worker 全程 io.Copy |
 | 网络命名空间穿越 | mgmt netns UDS → vsock 虚拟设备 | mgmt netns → vswitch netns → guest netns |
 | 快照/暂停影响 | Forwarder.Pause() 阻断新连接 | paused 状态下 ParkQueue.Park()，写 wake pipe → master → conductor |
-| 吞吐量上限 | sandbox-ctl io.Copy goroutine 瓶颈 | 当前：proxy worker io.Copy；flowtable 实现后：TC hook 线速转发 |
+| 吞吐量上限 | sandbox-ctl io.Copy goroutine 瓶颈 | proxy worker io.Copy goroutine |
 
 #### 4.2.2 proxy.mode 三档行为对比
 
@@ -1105,7 +1044,6 @@ mmapRecord:
     │   ├─ e2b + 49999 → KindUDS: dial forwardLn(CiUDS)  （同上，目标 127.0.0.1:49999）
     │   └─ any + 其他端口 → KindTCP: dial TCP FloatingIP:port via mg0
     │                        → io.Copy 双向 splice
-    │                        → [计划中] 写 eBPF flowtable + TC hook 接管
     │
     ├─ route.State == "paused"
     │   → ParkQueue.Park(sid, conn, deadline=now+park_timeout)
@@ -1195,34 +1133,7 @@ code-interpreter 进程监听 `127.0.0.1:49999`，通过 `ci.sock` 穿透到 hos
 
 `port ∉ {49983, 49999}` → `KindTCP → floatingIP:port`，由 vswitch DNAT 到 guest 内对应服务，proxy 不做协议解析。bare profile 访问 49983/49999 → `KindDeny(501 Not Implemented)`。
 
-### 4.5 eBPF flowtable 集成（计划中，proxy 当前代码尚未实现）
-
-> **注**：`internal/proxy/` 当前版本中不存在 `FlowTableWriter`、`bpf_map_update_elem` 等实现。以下为设计规格，待实现后生效。现阶段用户端口全程由 proxy worker io.Copy 双向 splice 承运。
-
-已建 TCP 连接在 proxy worker 完成第一个 splice 循环后，写入 vswitch 共享 flowtable（`/sys/fs/bpf/vswitch/map_flowtable`）：
-
-```go
-// key: 4 元组（网络字节序）
-type FlowKey struct {
-    SrcIP   [4]byte
-    SrcPort uint16
-    DstIP   [4]byte
-    DstPort uint16
-}
-
-// value: 目标 floatingip + port
-type FlowValue struct {
-    FloatingIP [4]byte
-    Port       uint16
-    _          [2]byte // padding
-}
-```
-
-写入后，vswitch TC hook 在内核直接按 flowtable 转发，proxy worker 退出该连接的 splice 循环（保留 goroutine 监听 FIN/RST 以清理 flowtable 条目）。
-
-**连接关闭时**：proxy worker 监听到 EOF/RST 后，执行 `bpf_map_delete_elem` 清理对应 flowtable 条目，避免旧条目干扰后续重用相同 4 元组的新连接。
-
-### 4.6 park/wake 详细流程
+### 4.5 park/wake 详细流程
 
 ```
 proxy worker（state=paused）       proxy master              conductor              sandbox
@@ -1310,10 +1221,9 @@ proxy（master/worker）本身不暴露控制面 REST API；其对外接口是 *
 | proxy master → conductor | config-socket plugin 平面 `PUT /internal/plugin/{id}/register` | **新增** |
 | proxy master → conductor | routesync wake 上行帧 | **新增** |
 | conductor → proxy master | routesync upsert/delete/hello/bookmark 下行帧 | **新增** |
-| proxy → vswitch bpffs | `bpf_map_update_elem` / `bpf_map_delete_elem` on `map_flowtable` | **新增** |
 | guest envd → proxy worker | MMDS v2 HTTP `169.254.169.254:80` → `127.0.0.1:19254`（vswitch DNAT）| 新增 MMDS sidecar，接口协议已有定义 |
 
-**过载风险评估**：routesync 为 push 模型，conductor 主动推送增量变更，proxy worker 本地查 proxyshm O(1)，无额外 RPC 调用在热路径上；flowtable 写入为内核调用，延迟 < 1 µs；整体热路径不引入新的外部依赖过载风险。
+**过载风险评估**：routesync 为 push 模型，conductor 主动推送增量变更，proxy worker 本地查 proxyshm O(1)，无额外 RPC 调用在热路径上；整体热路径不引入新的外部依赖过载风险。
 
 #### 4.8.3 上游调用方接入约定
 
@@ -1415,9 +1325,6 @@ proxy_routesync_reconnect_total
 proxy_proxyshm_slots{state}
 # state: running | paused
 
-# flowtable 写入延迟（计划中）
-proxy_flowtable_write_duration_seconds
-
 # MMDS 请求计数（计划中）
 proxy_mmds_requests_total{method, result}
 ```
@@ -1435,7 +1342,6 @@ proxy_mmds_requests_total{method, result}
 | wake 发送 | info | sid |
 | wake 成功（park 解除）| info | sid, park_duration_ms |
 | park 超时 | warn | sid, park_timeout_ms |
-| flowtable 写入失败 | error | sid, errno（降级为纯用户态转发） |
 | MMDS session token 颁发 | debug | floating_ip, sid |
 
 ### 4.11 配置项与特性开关
@@ -1687,35 +1593,6 @@ guest user app → guest 网卡 (virtio-net)
 sw-mX → mg0 → mgmt netns (sw0_mgmt) → proxy worker TCP socket
 ```
 
-规划入向（transit NIC 内核直通，绕过 proxy worker）：
-```
-transit NIC (eth1)  [TC hook: prog_tc_ingress]
-  │  bpf_map_lookup_elem(map_flowtable, {src,sport,dst,dport}) → 命中
-  │  改写 dst → floatingIP:PORT；proxy worker 用户态 splice 循环退出
-  ▼
-mg0  [mgmt veth peer，mgmt netns (sw0_mgmt)]
-  │  内核路由：floatingIP/20 → mg0
-  │  veth pair
-  ▼
-sw-mX  [switch netns]
-  │  TC DNAT: dst floatingIP → dst inner_ip
-  │  bpf_redirect → sw0-tN
-  ▼
-sw0-tN → tap fd → CH virtio-net backend → guest user app:PORT
-```
-
-规划回程（双向均内核直通）：
-```
-guest user app → CH virtio-net → tap → sw0-tN
-  │  TC SNAT: src inner_ip → src floatingIP
-  │  bpf_redirect → sw-mX → mg0 → host kernel
-  ▼
-transit NIC (eth1)  [TC hook: prog_tc_ingress，反向]
-  │  bpf_map_lookup_elem(map_flowtable, {src=floatingIP,sport,...}) → 命中
-  │  改写 src floatingIP → nodeIP（还原为节点地址）
-  ▼
-client
-```
 
 **② b. 跨节点外部流量（GENEVE 封装）**
 
@@ -1741,7 +1618,7 @@ gateway → transit NIC → TC ingress eBPF：
   → guest 网卡 → user app:PORT
 ```
 
-> **与 proxy 的关系**：用户端口流量（非 49983/49999）由 proxy worker（mgmt netns）通过 mgmt veth 路径（本节点）将 TCP 连接送达 sandbox；sandbox-ctl 不参与此路径；proxy worker 完成 L7 鉴权后 io.Copy 全程 splice（flowtable 接管后完全绕过 proxy worker 用户态）。
+> **与 proxy 的关系**：用户端口流量（非 49983/49999）由 proxy worker（mgmt netns）通过 mgmt veth 路径（本节点）将 TCP 连接送达 sandbox；sandbox-ctl 不参与此路径；proxy worker 完成 L7 鉴权后 io.Copy 全程 splice 透传。
 
 **③ tap fd 交接（cloud-hypervisor 拿到虚拟网卡）**
 
@@ -1798,8 +1675,6 @@ vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存）
 | running 沙箱新连接建立（TLS + 路由查表 + splice 建立）| < 10 ms | < 50 ms | **部分实测**：proxy worker 自身处理（loopback keep-alive）268 µs；loopback 新建 TLS 连接（RSA 2048 自签名）4.5 ms；真实部署另加网络 RTT（数据中心内 ~0.5–2 ms）及 TLS session ticket 复用影响；端到端 P50/P99 需在实际部署中标定 |
 | paused 沙箱 wake 延迟（park 开始到 splice 建立）| < 2 s | < 30 s | **估算**：受 resume（快照恢复）P99 主导，实际值取决于快照大小与存储速度 |
 | proxyshm.WorkerView.Lookup（seqlock O(1) hash）| ~51 ns | < 500 ns | **参考值**（原 sync.Map benchmark，Xeon E5-2680 v4）：命中 51 ns/miss 19 ns；proxyshm 定长 hash 无 GC 压力，预期相近；待 benchmark 验证 |
-| flowtable 写入（bpf_map_update_elem）| < 1 µs | < 5 µs | **估算**：syscall 开销约 100–300 ns + BPF LRU hash 更新，待 benchmark |
-| 已建连接 TC hook 转发（字节级吞吐）| 接近 NIC 线速 | — | eBPF 内核旁路，绕过 proxy worker 用户态 |
 | routesync 增量 upsert 应用延迟（纯 CPU）| ~12 µs | — | **实测参考**：JSON decode 11.5 µs；master 写 proxyshm（seqlock CAS）+ notify pipe 广播，替代原 sync.Map Store 51 ns；端到端含 UDS 传输，待 benchmark |
 | MMDS session token 颁发（HMAC 计算）| ~2.5 µs | — | **实测**：HMAC-SHA256 benchmark；含 HTTP handler 开销端到端待实测 |
 
@@ -1823,7 +1698,6 @@ vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存）
 | `node-ctl conductor` 崩溃 | 控制面中断；running 沙箱 proxy worker 凭 proxyshm 缓存继续转发；paused 沙箱 wake 挂起至 park_timeout | systemd Restart=on-failure → Reconcile 收养 → proxy master 自动重连重同步 |
 | proxy worker × 1 崩溃 | 该 worker 上连接 RST；新连接由其余 K-1 worker 承接 | master `superviseProxyWorker` goroutine 自动重启 worker（无需全量 routesync 重同步，proxyshm 已有最新路由）|
 | proxy worker × K（全部）崩溃 | 数据面中断 | master 依次重启所有 worker；running 沙箱的 microVM 不受影响 |
-| bpffs `map_flowtable` 不可访问 | flowtable 集成降级；proxy 继续纯用户态 splice 转发（功能不损失，吞吐下降）| 日志告警 `FlowtableUnavailable`；运维检查 vswitch 状态 |
 | routesync 通道积压（> 1024 帧）| proxy subscriber 被丢弃；指数退避重连后全量重同步 | 重连间隔：100ms → 200ms → 400ms … 最大 30s |
 | conductor 与 proxy 版本不匹配 | hello 帧 version 字段检测到不兼容时 proxy master 主动关闭连接并告警 | 滚动升级时先升 conductor，再重启 proxy master（master 重启时 worker 随之重启）|
 
@@ -1835,7 +1709,7 @@ vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存）
 - **MMDS token 无状态**：token = `sid + "." + hex(HMAC-SHA256(mmds_secret, sid))`，确定性计算，无存储、无 TTL；token 泄露风险由 mmds_secret 轮换（sandbox 销毁）覆盖。
 - **Forwarder 快照静默期保护**：快照（pause）开始前 `Forwarder.Pause()` 阻止新连接进入 envd.sock/ci.sock，`CloseActive()` 折叠所有活跃 sandbox-init relay 连接（层1通道 + 层2字节流一并关闭），保证快照窗口内不存在半开的 vsock 连接；快照完成后 `Resume()` 重新开放监听。防止快照期间 relay goroutine 持有 vsock channel 导致 VM 状态不一致。
 - **sandbox-ctl cgroup 隔离防死锁**：当前（`--cgroup-adopt`）sandbox-ctl 与 CH 同处 systemd unit cgroup；`memory.high` 节流时 Forwarder relay goroutine（层1 virtqueue 写入 + 层2 io.Copy）可能被一并卡住，造成整条 `proxy worker ↔ Forwarder ↔ CH virtio-vsock ↔ sandbox-init ↔ envd` 链路死锁；该风险当前已知并接受。计划（`--cgroup-isolated`，未实现）：sandbox-ctl 留在 unit cgroup，CH 移入子 cgroup `<unit-cgroup>/sandbox-<sid>/`；`memory.high` 仅节流 CH，sandbox-ctl 可随时发出 balloon inflate 命令解压；`KillMode=control-group` 覆盖整个子树，CH 不会因 sandbox-ctl 退出而成为孤儿。
-- **tap fd TUNSETPERSIST 防用户端口中断**：用户端口数据面路径（`vswitch tap → CH virtio-net → guest`）与 sandbox-ctl 完全解耦。cloud-hypervisor 崩溃时 tap fd 引用计数归零，字符设备端关闭；但 sw0-tN 因 `TUNSETPERSIST(1)` 仍留在 switch netns，下次 CH 重启时 `connector-ctl vswitch open-port` 重新交接新 fd，用户端口数据面可自愈，无需重建 vswitch 端口或重写 eBPF flowtable 条目。
+- **tap fd TUNSETPERSIST 防用户端口中断**：用户端口数据面路径（`vswitch tap → CH virtio-net → guest`）与 sandbox-ctl 完全解耦。cloud-hypervisor 崩溃时 tap fd 引用计数归零，字符设备端关闭；但 sw0-tN 因 `TUNSETPERSIST(1)` 仍留在 switch netns，下次 CH 重启时 `connector-ctl vswitch open-port` 重新交接新 fd，用户端口数据面可自愈，无需重建 vswitch 端口。
 
 ### 6.3 过载控制
 
@@ -1846,13 +1720,11 @@ vsock 由 cloud-hypervisor 实现，走 virtio-vsock virtqueue（共享内存）
 ### 6.4 冗余设计
 
 - **多 worker 冗余（SO_REUSEPORT）**：生产建议 2 个 worker；任一 worker 崩溃时 OS 将新连接分发至存活 worker，存量连接 RST 后 SDK 重连至存活 worker。
-- **eBPF flowtable bpffs pin**：flowtable BPF map pin 至 `/sys/fs/bpf/vswitch/`，proxy 进程崩溃后 map 持久存在，TC hook 继续按已记录条目转发已建 TCP 连接。
 - **conductor 与 proxy 进程解耦**：运维可独立重启 conductor 或 proxy master（master 重启时 worker 随之退出重启），互不依赖进程生命周期。
 
 ### 6.5 资源残留
 
 - **TCP 连接**：proxy 进程退出时 OS 自动关闭所有 socket，客户端收到 RST；无残留。
-- **eBPF flowtable 条目**：proxy 监听连接 EOF/RST 后清理对应条目；proxy 异常崩溃时，对应连接的 flowtable 条目将残留至 LRU 淘汰（`BPF_MAP_TYPE_LRU_HASH`，由 vswitch 控制 max_entries，不影响新连接）。
 - **park goroutine**：park_timeout 超时后自动回收；正常关闭时 `ParkQueue.Close()` 取消所有 context。
 
 ### 6.6 健康检查
@@ -1879,7 +1751,6 @@ proxy worker 不暴露独立健康探针端点；`node-ctl-proxy.service`（prox
 | `ProxyRoutesynReconnecting` | `rate(proxy_routesync_reconnect_total[5m]) > 0` | warning |
 | `ProxyParkTimeoutHigh` | `rate(proxy_park_duration_seconds_count{result="timeout"}[5m]) > 1` | critical |
 | `ProxyMasterDown` | `up{job="node-ctl-proxy"} == 0` | critical |
-| `ProxyFlowtableWriteError` | `rate(proxy_flowtable_write_errors_total[5m]) > 0` | warning |
 
 ### 6.8 数据可靠性设计
 
@@ -2064,7 +1935,6 @@ bare profile 缺少 in-guest 认证层是与 e2b profile 的结构性差距。�
 | US-2.1-2 | RouteSyncClient：config-socket plugin 平面 h2c 客户端、全量 + 增量同步、指数退避重连 | orchestrator | M（1w）|
 | US-2.1-3 | RouteTable + Dispatcher：运行态路由查表、三档端口分发（UDS/floatingip/park）| orchestrator | S（3d）|
 | US-2.1-4 | ParkQueue + WakeSender：park/wake 机制、per-sid singleflight、超时清理 | orchestrator | M（1w）|
-| US-2.1-5 | FlowTableWriter：新建连接写 eBPF flowtable，关闭时清理；bpffs 不可达时降级 | orchestrator | S（3d）|
 | US-2.1-6 | AuthMiddleware：off/log/enforce 三档，ConstantTimeCompare | orchestrator | S（2d）|
 | US-2.1-7 | MMDSServer：内嵌 MMDS v2 HTTP，ByFloatingIP 查路由表，session token TTL | orchestrator | M（1w）|
 | US-2.1-8 | serve 侧 routesync 广播：StreamAuthority、upsert/delete/bookmark/hello 下行帧实现 | orchestrator | M（1w）|
