@@ -23,7 +23,7 @@
 | G-3 | paused 沙箱可通过 /connect 或数据面流量透明唤醒 | SDK `sandbox.resume()` 及 park/wake 路径均可触发恢复 |
 | G-4 | TTL 超时自动挂起（pause），不中断数据面已建连接；集群模式下 deep_idle_sec 到期后进入深度休眠（SAVED）| timeout=300s 的沙箱 300s 后自动进入 paused；集群模式下深度休眠后可在任意节点 import + resume |
 | G-5 | 沙箱跨节点迁移（export/import）：将暂停沙箱打包为含 snapshot manifest ref 的 migration token，在另一节点导入恢复 | `node-ctl export-sandbox` / `node-ctl import-sandbox` 可正常执行；导入后沙箱以 paused 状态存在于目标节点，connect 后可正常使用 |
-| G-6 | 在 running/paused 沙箱内同步执行任意命令（exec），支持返回 stdout/stderr 及退出码；paused 沙箱自动恢复后执行；dead 沙箱返回 404 | `POST /sandboxes/{id}/exec` 在沙箱内运行 `echo hello`，返回正确 stdout 和 exitCode=0；paused 沙箱自动恢复后执行成功 |
+| G-6 | 在 running/paused 沙箱内执行任意命令，通过 WebSocket 全双工传输 stdin/stdout/stderr 及退出码；支持文件上传/下载；paused 沙箱握手阶段自动恢复；dead 沙箱返回 404 | 见下方验收标准 |
 | G-7 | 多租户隔离：每个 API Key 只能操作自己的沙箱 | 不同 API Key 之间的沙箱完全隔离 |
 
 **Non-Goals**
@@ -126,11 +126,29 @@
 #### Story 6：在沙箱中执行命令
 
 ```
-作为一个 SDK 用户，我想要在沙箱内同步执行任意命令并获取 stdout、stderr 和退出码，
-以便在沙箱环境中完成构建、测试或文件操作等任务。
+作为一个 SDK 用户，我想要在沙箱内执行任意命令并获取 stdout、stderr 和退出码，
+支持向命令写入 stdin，以便完成构建、测试、文件上传/下载等任务。
 ```
 
-**外部表现**：POST /sandboxes/{id}/exec 携带 `{cmd, envs, cwd, timeout_ms}`；paused 沙箱自动恢复后执行；命令完成后返回 `{stdout, stderr, exit_code, duration_ms}`；stdout + stderr 合计不超过 10 MiB（超出截断并附 `"truncated": true`）；超时时命令被 SIGKILL，`exit_code: -1`，HTTP 仍为 200；dead 沙箱返回 404。
+**外部表现**：`GET /sandboxes/{id}/exec` 通过 WebSocket（RFC 6455，子协议 `sandbox-exec.v1`）在同一连接上全双工传输 stdin/stdout/stderr。WebSocket 建立后，客户端发送 channel-3 init 帧（JSON）携带命令规格（`cmd`/`env`/`cwd`/`user`/`timeout_ms`），服务端解析后 fork 命令。消息帧首字节为 channel ID：0=stdin，1=stdout，2=stderr，3=init（仅首帧，client→server），4=控制（JSON，含 exit_code/error，server→client）。paused 沙箱在握手阶段自动恢复；`timeout_ms=0`（缺省）不设超时，`> 0` 时到期 SIGKILL 并通过控制帧通知；dead 沙箱握手阶段返回 404；stdout/stderr 无大小限制，直接透传。
+
+**验收标准**
+
+| # | 场景 | 操作 | 期望结果 |
+|---|------|------|---------|
+| AC-1 | 短命令 | 建立 WebSocket；发 ch3 `{"cmd":["echo","hello"]}`；不发 stdin | channel-1 收到 `hello\n`；channel-4 收到 `{"exit_code":0,"timed_out":false}`；连接关闭 |
+| AC-2 | stderr 分离 | 建立 WebSocket；发 ch3 `{"cmd":["sh","-c","echo out; echo err >&2"]}` | channel-1 收到 `out\n`；channel-2 收到 `err\n`；channel-4 exit_code=0 |
+| AC-3 | 非零退出码 | 建立 WebSocket；发 ch3 `{"cmd":["sh","-c","exit 42"]}` | channel-4 `{"exit_code":42,"timed_out":false}` |
+| AC-4 | 文件下载 | 建立 WebSocket；发 ch3 `{"cmd":["cat","/data/large.bin"]}`（100 MiB 文件） | channel-1 收到完整二进制字节（无截断）；channel-4 exit_code=0 |
+| AC-5 | 文件上传 | 建立 WebSocket；发 ch3 `{"cmd":["sh","-c","cat > /data/input.csv"]}`；发 channel-0 CSV 字节；发 channel-0 空帧（stdin EOF） | guest 内 `/data/input.csv` 内容与发送字节一致；channel-4 exit_code=0 |
+| AC-6 | paused 自动恢复 | 沙箱为 paused 状态时建立 WebSocket；发 ch3 `{"cmd":["echo","ok"]}` | 握手阶段完成 resume（101 响应）；channel-4 exit_code=0 |
+| AC-7 | dead 沙箱 | 沙箱为 dead 状态时建立 WebSocket | HTTP 握手返回 404，WebSocket 不建立 |
+| AC-8 | 超时 SIGKILL | 建立 WebSocket；发 ch3 `{"cmd":["sleep","3600"],"timeout_ms":1000}` | ~1s 后收到 channel-4 `{"exit_code":-1,"timed_out":true}`；连接关闭 |
+| AC-9 | 无超时 | 建立 WebSocket；发 ch3 `{"cmd":["sleep","10"]}`（不传 timeout_ms） | 命令自然退出后收到 channel-4 exit_code=0；不提前终止 |
+| AC-10 | TTL 竞态 | 建立 WebSocket；发 ch3 `{"cmd":["sleep","60"]}`；命令运行中 Reaper pause 沙箱 | 收到 channel-4 `{"error":"sandbox_paused"}`；连接关闭 |
+| AC-11 | 并发 exec | 同一沙箱同时建立 3 个 WebSocket；各发 ch3 `{"cmd":["sleep","1"]}` | 三个连接独立执行，互不干扰，各自收到 channel-4 exit_code=0 |
+| AC-12 | init 帧缺失 | 建立 WebSocket 后不发 ch3，等待 5s | 收到 channel-4 `{"error":"internal:init timeout"}`；连接关闭 |
+| AC-13 | init 帧格式错误 | 建立 WebSocket；发 ch3 payload 为非合法 JSON 或缺少 `cmd` 字段 | 收到 channel-4 `{"error":"internal:invalid init"}`；连接关闭 |
 
 ### 3.2 架构影响分析
 
@@ -209,68 +227,145 @@ conductor 是节点数据面和控制面的枢纽，架构影响涵盖以下元�
 
 #### exec 规格
 
+exec 使用 **WebSocket** 协议（RFC 6455），在同一连接上同时双向传输 stdin/stdout/stderr，天然支持短命令、文件上传/下载及未来交互式场景。
+
+**连接建立**
+
+```
+GET /sandboxes/{id}/exec
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: <base64>
+Sec-WebSocket-Protocol: sandbox-exec.v1
+
+101 Switching Protocols
+Sec-WebSocket-Protocol: sandbox-exec.v1
+
+// WebSocket 建立后，client 立即发 channel-3 init 帧（握手后首个 Binary 帧）：
+[0x03][{"cmd":["python3","-c","print('hello')"],"cwd":"/home/user","user":"user","timeout_ms":0}]
+```
+
+**init 帧（channel 3）字段**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `cmd` | string[] | 是 | 命令及参数列表，如 `["python3","main.py"]` |
+| `env` | object | 否 | 额外环境变量 KV，叠加在 guest 已有环境之上 |
+| `cwd` | string | 否 | 工作目录，缺省 guest 根目录 |
+| `user` | string | 否 | 执行身份，`"uid[:gid]"` 或用户名；缺省 root |
+| `timeout_ms` | int | 否 | 超时毫秒数；0（缺省）不设超时；> 0 时到期 SIGKILL |
+
+服务端在收到 init 帧后才 fork 命令；client 可在发完 init 帧后立即发 channel-0 stdin 数据（服务端缓冲至 fork 完成）。若服务端 5 秒内未收到 init 帧，发 channel-4 错误帧后关闭连接。
+
+**消息帧格式**（Binary WebSocket frame）
+
+```
+┌──────────┬─────────────────────────────┐
+│ channel  │  payload                    │
+│ (1 byte) │  (0..N bytes)               │
+└──────────┴─────────────────────────────┘
+```
+
+| Channel | 方向 | 用途 |
+|---------|------|------|
+| `0x00` | client → server | stdin；**payload 为空（0 字节）表示 stdin EOF** |
+| `0x01` | server → client | stdout |
+| `0x02` | server → client | stderr |
+| `0x03` | client → server | init（握手后首帧，携带执行参数 JSON）|
+| `0x04` | server → client | 控制帧（JSON）|
+
+控制帧（channel 4）payload 为 JSON：
+
+```json
+// 正常退出
+{"exit_code": 0, "timed_out": false}
+
+// 超时
+{"exit_code": -1, "timed_out": true}
+
+// 内部错误
+{"error": "sandbox_paused"}
+{"error": "internal: <reason>"}
+```
+
 **执行路径**
 
 ```
-POST /sandboxes/{id}/exec
-  │
-  ▼ orch.Exec
-  1. st.Get(id) → sb；若 sb == nil → 404；ownsSandbox 验证
+GET /sandboxes/{id}/exec
+  │  Upgrade: websocket
+  ▼ orch.Exec（WebSocket handler）
+  1. st.Get(id) → sb；若 sb == nil → 403/404（握手阶段 HTTP 错误，未升级）
   2. 若 sb.State == dead → 404
-  3. 若 sb.State == paused → sf.Do(sid, resumeIfPaused)（同 /connect 单飞路径）
-  4. 计算 deadline = now + min(req.TimeoutMs 或 30_000, 300_000) ms
-  5. fork sandbox-ctl exec --sid --cmd --env --cwd --timeout-ms
+  3. 若 sb.State == paused → sf.Do(sid, resumeIfPaused) ← resume 超时：握手返回 503
+  4. 101 Switching Protocols ← WebSocket 连接建立
+  5. 等待 channel-3 init 帧（deadline: 5s）
+       → 超时或格式错误 → 发 channel-4 {"error":"internal:..."} → Close
+       → 解析得 cmd/env/cwd/user/timeout_ms
+  6. 计算 deadline：timeout_ms > 0 时 deadline = now + timeout_ms；= 0 不设
+  7. fork sandbox-ctl exec \
+         --sandbox-id <id> \
+         --cwd <cwd> \
+         --user <user>（若非空）\
+         [--env KEY=VALUE ...] \
+         --stdin=true --stdout=true --stderr=true \
+         （不传 --tty：tty 合并 stdout/stderr 为单一 PTY 流）\
+         -- <cmd...>
        └── sandbox-ctl exec → ctl.sock → sandbox-ctl run → vsock → sandbox-init
-           sandbox-init setns(mnt+pid) 后 forkExecChild，stdout/stderr 经 MUX 透传
-  6. node-ctl 累积 stdout + stderr；超过 10 MiB 时停止读取，标记 truncated=true
-  7. 等待子进程退出，或 deadline 到期
-       a. 正常退出 → exit_code=N
-       b. deadline 到期 → node-ctl SIGKILL sandbox-ctl exec → exit_code=-1
-       c. ctl.sock / vsock 连接失败 → 500
-  8. 返回 ExecResult{Stdout, Stderr, ExitCode, DurationMs, Truncated}
+           sandbox-init setns(mnt+pid) 后 forkExecChild，stdin/stdout/stderr 经 MUX 透传
+  8. 三路 goroutine 并发：
+       G1: 读 WebSocket channel-0 帧 → 写 sandbox-ctl exec stdin pipe
+           （payload 为空时关闭 stdin pipe 写端，向命令发 EOF）
+       G2: 读 sandbox-ctl exec stdout pipe → 发 WebSocket channel-1 帧
+       G3: 读 sandbox-ctl exec stderr pipe → 发 WebSocket channel-2 帧
+  9. 等待子进程退出，或 deadline 到期
+       a. 正常退出 → 发 channel-4 {"exit_code":N,"timed_out":false} → Close WebSocket
+       b. deadline 到期 → SIGKILL sandbox-ctl exec → 发 channel-4 {"exit_code":-1,"timed_out":true} → Close
+       c. "connection lost"（vsock 中断，含 Reaper pause 竞态）→ 发 channel-4 {"error":"sandbox_paused"} → Close
+       d. 其余内部错误 → 发 channel-4 {"error":"internal:<reason>"} → Close
 ```
 
-**请求体**
+**使用示例**
 
-```json
-{
-  "cmd":        ["python3", "-c", "print('hello')"],   // 必填；argv[0] 为可执行文件
-  "envs":       {"KEY": "value"},                      // 可选；追加到 guest 默认环境
-  "cwd":        "/home/user",                          // 可选；缺省 envd 默认工作目录
-  "timeout_ms": 30000                                  // 可选；缺省 30 000 ms，最大 300 000 ms
-}
 ```
+// 短命令
+client → channel-3: {"cmd":["python3","-c","print('hello')"]}
+← channel-1: b"hello\n"
+← channel-4: {"exit_code":0,"timed_out":false}
 
-**响应体（200）**
+// 文件下载（cat 大文件）
+client → channel-3: {"cmd":["cat","/data/model.bin"]}
+← channel-1: <binary file bytes, 任意大小>
+← channel-4: {"exit_code":0,"timed_out":false}
 
-```json
-{
-  "stdout":      "hello\n",
-  "stderr":      "",
-  "exit_code":   0,
-  "duration_ms": 42,
-  "truncated":   false
-}
+// 文件上传（client 发 stdin）
+client → channel-3: {"cmd":["sh","-c","cat > /data/input.csv"]}
+client → channel-0: <CSV bytes>
+client → channel-0: <empty payload>  // stdin EOF 信号
+← channel-4: {"exit_code":0,"timed_out":false}
+
+// 带超时和环境变量
+client → channel-3: {"cmd":["make","test"],"cwd":"/app","env":{"CI":"1"},"timeout_ms":30000}
+← channel-1/2: <build output>
+← channel-4: {"exit_code":0,"timed_out":false}
 ```
 
 **静态约束**
 
 | 指标 | 值 |
 |------|-----|
-| 默认超时 | 30 s |
-| 最大超时 | 300 s |
-| stdout + stderr 合计上限 | 10 MiB；超出截断，响应附 `"truncated": true` |
-| 并发 exec 数（per sandbox）| 无硬上限；受 sandbox-init 侧限制 |
-
-**超时处理**：`timeout_ms` 到期时 node-ctl 向 sandbox-ctl exec 子进程发 SIGKILL，返回 `exit_code: -1`，响应码仍为 `200`（exec 本身成功，命令超时属业务语义）；沙箱在恢复阶段超时返回 `503`；sandbox-ctl exec 内部错误（ctl.sock / vsock 连接失败）返回 `500`。
+| 超时 | `timeout_ms=0`（缺省）不设限；`> 0` 时到期 SIGKILL，exit_code=-1 |
+| stdout/stderr 大小 | 无限制（直接透传，不缓冲）|
+| stdin | WebSocket channel-0 帧，任意大小 |
+| 并发 exec 数（per sandbox）| node-ctl 层无限制；sandbox-init 侧以 guest cgroup `pids.max`（建议默认 32）防止进程爆炸 |
 
 **状态语义**
 
 | 沙箱状态 | 行为 |
 |---------|------|
-| running | 直接 fork sandbox-ctl exec |
-| paused  | sf.Do(resumeIfPaused) 恢复为 running 后执行；exec 不延长 TTL |
-| dead    | 404 |
+| running | 握手后直接 fork sandbox-ctl exec |
+| paused  | sf.Do(resumeIfPaused) 恢复为 running 后握手；timeout 从 init 帧接收后开始计算 |
+| dead    | 握手阶段 404 |
+| running → paused（TTL 到期竞态）| vsock 中断；channel-4 `{"error":"sandbox_paused"}`，连接关闭；exec 不延长 TTL |
 
 ### 3.4 风险及设计约束
 
@@ -897,31 +992,38 @@ POST /sandboxes/{id}/exec
          └── resume 完成后继续执行（TTL 不因 exec 延长）
   5. timeout = min(req.TimeoutMs 若为 0 取 30_000, 300_000) ms
      deadline = now + timeout ms        ← 在步骤 4 完成后重新计算 now
-  6. exec sandbox-ctl exec \
-         --sid <id> \
-         --cmd <req.Cmd> \
-         --env <req.Envs> \
-         --cwd <req.Cwd> \
-         --timeout-ms <deadline - now>  ← fork 时动态计算剩余时间
+  6. fork sandbox-ctl exec \
+         --sandbox-id <id> \
+         --cwd <cwd> \
+         --user <user>（若非空）\
+         [--env KEY=VALUE ...] \
+         --stdin=true --stdout=true --stderr=true \
+         （不传 --tty：tty 合并 stdout/stderr 为单一 PTY 流）\
+         -- <cmd...>
        sandbox-ctl exec → ctl.sock → sandbox-ctl run → vsock → sandbox-init；
-       sandbox-init setns(mnt+pid) 后 forkExecChild，stdout/stderr 经 MUX 透传；
-       sandbox-ctl exec 以命令退出码作为自身退出码（fd=3 JSON 为 node-ctl 侧计划接口）；
-       内部错误（连不上 ctl.sock 或 vsock 通道等）：sandbox-ctl exec 以非零退出，stderr 记录原因
-  7. node-ctl 累积 stdout + stderr；合计超过 10 MiB 时停止读取，标记 truncated=true
+       sandbox-init setns(mnt+pid) 后 forkExecChild，stdin/stdout/stderr 经 MUX 透传；
+       sandbox-ctl exec 以命令退出码（0-255）作为自身退出码；
+       内部错误时非零退出，stderr 输出 "exec: ..." 前缀
+       （fd=3 JSON 结构化退出为计划接口，当前未实现；超时由 node-ctl SIGKILL 实现）
+  7. 三路 goroutine 并发（WebSocket ↔ sandbox-ctl exec pipe）：
+       G1: 读 WebSocket channel-0 帧 → 写 stdin pipe
+       G2: 读 stdout pipe → 发 WebSocket channel-1 帧（直接转发，不缓冲）
+       G3: 读 stderr pipe → 发 WebSocket channel-2 帧（直接转发，不缓冲）
   8. 等待子进程退出，或 deadline 到期
-       a. 正常退出：读取 fd=3 JSON → exit_code=N
-       b. deadline 到期：SIGKILL sandbox-ctl exec → exit_code=-1
-       c. fd=3 为空（内部错误）：返回 500，日志记录 stderr
-  9. return ExecResult{Stdout, Stderr, ExitCode, DurationMs, Truncated}
+       a. 正常退出 → 发 channel-4 {"exit_code":N,"timed_out":false} → Close WebSocket
+       b. deadline 到期 → SIGKILL sandbox-ctl exec → 发 channel-4 {"exit_code":-1,"timed_out":true} → Close
+       c. 内部错误（非零退出，stderr 含 "exec: " 前缀）：
+            └── "connection lost" → vsock 中断（含 Reaper pause 竞态）→ channel-4 {"error":"sandbox_paused"} → Close
+            └── 其余 → channel-4 {"error":"internal:<reason>"} → Close
 ```
 
 **与其他 sandbox-ctl 调用的一致性**：`exec sandbox-ctl exec` 与 `exec sandbox-ctl snapshot`、`exec sandbox-ctl info` 遵循同一模式——node-ctl 不直接持有 per-sandbox 的 envd 连接，所有 guest 侧细节封装在 sandbox-ctl 内。
 
-**与 /connect 的关系**：步骤 4 的自动恢复与 `/connect` 走完全相同的 `sf.Do(sid, resumeIfPaused)` 路径——先到的 goroutine 执行恢复，后到的等待同一 future，不会触发双重 launch。exec 不延长 TTL；若沙箱的 TTL 在命令执行期间到期，Reaper 会 pause 沙箱，sandbox-ctl exec 因 vsock 通道中断而返回内部错误（步骤 8c）。
+**与 /connect 的关系**：步骤 3 的自动恢复与 `/connect` 走完全相同的 `sf.Do(sid, resumeIfPaused)` 路径，不会触发双重 launch。timeout 从 WebSocket 握手完成后开始计算，resume 耗时不占用命令执行窗口。exec 不延长 TTL；Reaper pause 竞态通过 channel-4 `{"error":"sandbox_paused"}` 通知客户端后关闭连接，无法消除。
 
-**并发语义**：同一沙箱可并发多个 exec 请求，每次调用独立 fork 一个 sandbox-ctl exec 子进程；node-ctl 层不额外限流。
+**并发语义**：同一沙箱可并发多个 exec WebSocket 连接，每次调用独立 fork 一个 sandbox-ctl exec 子进程；node-ctl 层不额外限流；sandbox-init 侧以 guest cgroup `pids.max`（建议默认 32）防止进程爆炸，超限时通过 channel-4 返回内部错误后关闭连接。
 
-**超时语义**：`timeout_ms` 超时（步骤 8b）时命令被 SIGKILL，响应码仍为 `200`，`exit_code=-1`（命令超时属业务语义）；若沙箱在恢复阶段超时，返回 `503`；若 sandbox-ctl exec 内部错误，返回 `500`。
+**超时语义**：`timeout_ms=0`（缺省）不设超时，命令运行至自然退出或客户端关闭连接。`timeout_ms > 0` 时到期 SIGKILL sandbox-ctl exec，channel-4 发送 `{"exit_code":-1,"timed_out":true}` 后关闭连接。resume 阶段超时在握手阶段返回 HTTP 503。
 
 ```mermaid
 sequenceDiagram
@@ -931,37 +1033,54 @@ sequenceDiagram
     participant SR as sandbox-ctl run
     participant SI as sandbox-init(guest)
 
-    C->>O: POST /sandboxes/{id}/exec
+    C->>O: GET /sandboxes/{id}/exec?cmd=...&timeout_ms=0<br>Upgrade: websocket / Sec-WebSocket-Protocol: sandbox-exec.v1
     O->>O: st.Get(id) / ownsSandbox / state 校验
     alt state=paused
-        O->>O: sf.Do(resumeIfPaused)
+        O->>O: sf.Do(resumeIfPaused)（失败 → 503，握手中止）
     end
-    O->>O: 计算 deadline（now + min(timeout_ms, 300_000)）
-    O->>SE: fork sandbox-ctl exec<br>--sid --cmd --env --cwd --user --timeout-ms
+    O-->>C: 101 Switching Protocols
+    O->>O: timeout_ms>0 时设 deadline（resume 后计算）
+    O->>SE: fork sandbox-ctl exec<br>--sandbox-id --cwd --user [--env KEY=V ...]<br>--stdin=true --stdout=true --stderr=true -- CMD [ARGS...]
     SE->>SR: TypeExecRequest（argv/env/cwd/user/StdioSpec）via ctl.sock
     SR->>SI: 建立 vsock exec channel，转发 ExecSpec
     SI->>SI: setns(mnt+pid) + forkExecChild
-    SI-->>SR: exec ack（命令已 fork）
-    SR-->>SE: TypeExecAck（StdioSpec）via ctl.sock
-    Note over SE,SR: ctl.sock 连接升级为 stdio MUX（mux.NewSession）
-    Note over SR,SI: vsock 连接升级为 stdio MUX（SR relay 两端）
-    loop stdout / stderr 流式输出
-        SI->>SR: MUX 帧（stdout/stderr data）
-        SR->>SE: MUX 帧转发
-        SE->>O: pipe 写入（O 侧 goroutine 累积；超 10 MiB 截断，truncated=true）
+    SI-->>SR: exec ack
+    SR-->>SE: TypeExecAck via ctl.sock
+    Note over SE,SR: ctl.sock 升级为 stdio MUX
+    Note over SR,SI: vsock 升级为 stdio MUX（SR relay）
+    par G1: stdin
+        C->>O: WS frame ch=0 <stdin bytes>
+        O->>SE: stdin pipe 写入
+    and G2: stdout
+        SI->>SR: MUX stdout 帧
+        SR->>SE: 转发
+        SE->>O: stdout pipe
+        O->>C: WS frame ch=1 <stdout bytes>
+    and G3: stderr
+        SI->>SR: MUX stderr 帧
+        SR->>SE: 转发
+        SE->>O: stderr pipe
+        O->>C: WS frame ch=2 <stderr bytes>
     end
     SI->>SR: MUX ExitStatus（exit_code=N）
-    SR->>SE: MUX ExitStatus 转发
-    SE->>SE: sess.ExitReceived()；以 exitCode 退出
+    SR->>SE: ExitStatus 转发
+    SE->>SE: sess.ExitReceived()；以命令退出码退出
     alt 正常退出
         SE-->>O: 子进程退出（exitCode=N）
-        O-->>C: 200 ExecResult{stdout,stderr,exitCode,durationMs,truncated}
+        O->>C: WS frame ch=3 {"exit_code":N,"timed_out":false}
+        O->>C: Close WebSocket
     else deadline 到期
         O->>SE: SIGKILL
-        O-->>C: 200 {exitCode=-1, truncated}
-    else ctl.sock/vsock 连接失败
-        SE-->>O: 非零退出 + stderr 错误信息
-        O-->>C: 500
+        O->>C: WS frame ch=3 {"exit_code":-1,"timed_out":true}
+        O->>C: Close WebSocket
+    else vsock 中断（Reaper pause 竞态）
+        SE-->>O: 非零退出，stderr="exec: connection lost..."
+        O->>C: WS frame ch=3 {"error":"sandbox_paused"}
+        O->>C: Close WebSocket
+    else 其余内部错误
+        SE-->>O: 非零退出，stderr="exec: ..."
+        O->>C: WS frame ch=3 {"error":"internal:<reason>"}
+        O->>C: Close WebSocket
     end
 ```
 
@@ -1056,7 +1175,7 @@ sequenceDiagram
 | POST | /sandboxes/{id}/pause | 挂起沙箱 | X-API-KEY |
 | POST | /sandboxes/{id}/connect | 恢复沙箱 / 延长 TTL | X-API-KEY |
 | POST | /sandboxes/{id}/timeout | 设置超时 | X-API-KEY |
-| POST | /sandboxes/{id}/exec | 在沙箱内执行命令 | X-API-KEY |
+| GET  | /sandboxes/{id}/exec | 在沙箱内执行命令（WebSocket 升级）| X-API-KEY |
 | POST | /sandboxes/{id}/export | 导出 migration token | X-API-KEY |
 | POST | /sandboxes/import | 导入 migration token | X-API-KEY |
 | GET  | /health | 健康检查 | 无 |
@@ -1096,7 +1215,8 @@ sequenceDiagram
 | 情形 | HTTP 码 | 触发端点 |
 |------|--------|---------|
 | 成功创建沙箱 | 201 | POST /sandboxes |
-| 成功查询 / 恢复 / exec / 导出导入 / build 状态 | 200 | GET, POST connect/exec/export/import, GET status |
+| 成功查询 / 恢复 / 导出导入 / build 状态 | 200 | GET, POST connect/export/import, GET status |
+| exec WebSocket 升级成功 | 101 | GET /sandboxes/{id}/exec |
 | 模板注册 / 构建触发成功 | 202 | POST /v3/templates, POST /v2/templates/.../builds/... |
 | 成功销毁 / pause / timeout | 204 | DELETE, POST pause/timeout |
 | build 文件检查成功 | 201 | GET /templates/{tid}/files/{hash} |
@@ -1228,31 +1348,54 @@ sequenceDiagram
 
 ---
 
-##### POST /sandboxes/{id}/exec — 在沙箱内执行命令
+##### GET /sandboxes/{id}/exec — 在沙箱内执行命令（WebSocket）
 
 **路径参数**：`id` — 沙箱实例 ID
 
-**请求体**（JSON）：
+**升级握手**：客户端须携带 `Upgrade: websocket` 及 `Sec-WebSocket-Protocol: sandbox-exec.v1`；服务端返回 `101 Switching Protocols`，之后连接切换为 WebSocket Binary 帧。URL 无查询参数。
+
+**init 帧（channel 3，握手后首帧）**：WebSocket 建立后，客户端必须立即发送一个 channel-3 Binary 帧，payload 为执行参数 JSON：
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `cmd` | string[] | 是 | 命令及参数列表，如 `["python3", "main.py"]` |
-| `envs` | object | 否 | 额外注入的环境变量 KV，叠加在沙箱已有环境之上 |
+| `cmd` | string[] | 是 | 命令及参数列表，如 `["python3","main.py"]` |
+| `env` | object | 否 | 额外环境变量 KV，叠加在 guest 已有环境之上 |
 | `cwd` | string | 否 | 工作目录，缺省为 guest 根目录 |
-| `timeoutMs` | int | 否 | 命令超时毫秒数；0 取默认值 30000；上限 300000 |
 | `user` | string | 否 | 执行身份，`"uid[:gid]"` 或 `/etc/passwd` 中的用户名；缺省 root |
+| `timeout_ms` | int | 否 | 命令超时毫秒数；`0`（缺省）不设超时；`> 0` 时到期 SIGKILL |
 
-**响应**（200）：
+**WebSocket 消息帧格式**（Binary frame）：
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `stdout` | string | 命令标准输出（UTF-8），累计超过 10 MiB 时截断 |
-| `stderr` | string | 命令标准错误（UTF-8），同上截断 |
-| `exitCode` | int | 命令退出码；超时被 SIGKILL 时返回 `-1` |
-| `durationMs` | int | 命令实际执行时间（毫秒） |
-| `truncated` | bool | stdout + stderr 合计超过 10 MiB 时为 true |
+```
+[channel: 1 byte][payload: N bytes]
+```
 
-> 命令超时（`exitCode=-1`）仍返回 200；沙箱自动恢复超时或内部错误返回 503/500。
+| Channel | 方向 | 说明 |
+|---------|------|------|
+| 0 | client → server | stdin；payload 为空（0 字节）表示 stdin EOF |
+| 1 | server → client | stdout |
+| 2 | server → client | stderr |
+| 3 | client → server | init（握手后首帧，携带执行参数）|
+| 4 | server → client | 控制 JSON（退出码 / 错误） |
+
+**控制帧（channel 4）JSON**：
+
+| 场景 | 内容 |
+|------|------|
+| 正常退出 | `{"exit_code": N, "timed_out": false}` |
+| 超时 SIGKILL | `{"exit_code": -1, "timed_out": true}` |
+| 沙箱 pause 竞态 | `{"error": "sandbox_paused"}` |
+| 其他内部错误 | `{"error": "internal:<reason>"}` |
+
+**握手阶段错误**（HTTP 响应，WebSocket 不建立）：
+
+| 情形 | HTTP 码 |
+|------|--------|
+| 沙箱不存在或租户不匹配 | 404 |
+| paused 沙箱恢复失败 | 503 |
+| 其他内部错误 | 500 |
+
+> paused 沙箱在握手阶段自动触发 resume；`timeout_ms` 从 init 帧接收后开始计算；stdout/stderr 无大小限制，直接透传。
 
 ---
 
