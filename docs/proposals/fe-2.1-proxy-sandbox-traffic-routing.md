@@ -1197,11 +1197,217 @@ envd（guest 内）                         proxy MMDS server
      │ envd re-key 完成，后续 RPC 验 token
 ```
 
-### 4.7.1 用户凭据扩展设计（规划）
+### 4.7.0 user-data：proxy master Admin API 方案（规划）
+
+#### 概述
+
+proxy master 新增独立的 **Admin HTTP 服务**（HTTP/1.1 over UDS），提供 `PUT / PATCH / DELETE / GET /sandboxes/{sid}/user-data` 四个端点，允许宿主机上的受信调用方（conductor、业务系统）向 sandbox 注入任意 JSON 数据，guest 内用户进程通过 MMDS `GET /latest/user-data` 读取。
+
+PUT/PATCH 语义对齐 Firecracker MMDS 原生接口约定（infra 仓库 `fc.apiClient.setMmds()` 使用 `PUT /mmds` 在 cold boot / resume 时全量写入，`PATCH /mmds` 执行部分合并）：PUT 全量替换，PATCH 按 RFC 7396 JSON Merge Patch 递归合并。merge 在 master 侧执行，向 worker 分发始终是合并后的完整 payload，worker 只处理"设置"和"清除"两种语义。
+
+本方案不修改 routesync 协议，conductor 无需感知 user-data 概念，改动集中在 proxy master / worker 和 MMDS server。
+
+#### 数据流
+
+```
+业务系统 / conductor
+    │  PUT   /sandboxes/{sid}/user-data   (全量替换，对齐 FC PUT /mmds)
+    │  PATCH /sandboxes/{sid}/user-data   (RFC 7396 merge，对齐 FC PATCH /mmds)
+    │  DELETE /sandboxes/{sid}/user-data  (清除)
+    ▼
+proxy master (root ns)
+  AdminServer: /run/sandbox/proxy-admin.sock (0600)
+  userDataStore: map[sid → json.RawMessage]  ← 始终存最终合并值
+    │  PATCH 时：jsonMergePatch(current, body) 后写 store
+    │  CredBroadcaster → credFD pipe × K（per-worker，[4B LE][JSON]）
+    │  worker 启动时：全量快照 + sentinel → 注册增量更新
+    ▼
+proxy worker × K (mgmt ns)
+  credStore: map[sid → json.RawMessage]
+  credReady: bool  ← sentinel 到达前拒绝 GET /latest/user-data
+    ▼
+proxy MMDS server (127.0.0.1:19254, mgmt ns)
+  GET /latest/user-data  (X-metadata-token 验证 → WorkerView.UserData(sid))
+    ▼
+guest 用户进程
+```
+
+#### Admin UDS API
+
+**监听地址**：`/run/sandbox/proxy-admin.sock`，权限 `0600`，root ns，HTTP/1.1 over UDS，无 TLS，鉴权依赖文件系统权限（仅同节点 root 进程可连接）。
+
+| 方法 | 路径 | 语义 | 成功响应 |
+|------|------|------|---------|
+| `PUT` | `/sandboxes/{sid}/user-data` | 全量替换 | `204 No Content` |
+| `PATCH` | `/sandboxes/{sid}/user-data` | RFC 7396 JSON Merge Patch | `204 No Content` |
+| `DELETE` | `/sandboxes/{sid}/user-data` | 清除 | `204 No Content` |
+| `GET` | `/sandboxes/{sid}/user-data` | 读当前值（调试用） | `200` + JSON |
+
+公共约束：`Content-Type: application/json`；body 非合法 JSON 返回 `400`；单 sandbox payload 上限 64 KiB，超限返回 `413`；`GET` 未知 sid 返回 `404`；`PUT / PATCH` 未知 sid 创建新条目。
+
+**PATCH JSON Merge 示例**：
+
+```
+初始值:    {"db_host": "10.0.0.1", "db_pass": "secret", "region": "cn-bj"}
+PATCH body: {"db_pass": "new_secret", "region": null, "timeout": 30}
+合并后:    {"db_host": "10.0.0.1", "db_pass": "new_secret", "timeout": 30}
+           （region 因 null 被删除；db_host 未提及保留；timeout 为新增）
+```
+
+#### Proxy Master 内部结构
+
+**userDataStore**（master 侧单一可信存储）：
+
+```go
+type userDataStore struct {
+    mu    sync.RWMutex
+    store map[string]json.RawMessage // sid → 已 merge 的完整 payload
+}
+```
+
+PATCH 处理流：
+
+```
+HTTP PATCH /sandboxes/{sid}/user-data
+  │ 1. 读 body，json.Valid() + 大小检查
+  │ 2. store.mu.Lock()
+  │    merged = jsonMergePatch(store.store[sid], body)
+  │    store.store[sid] = merged
+  │    store.mu.Unlock()
+  │ 3. credBC.Broadcast(UserDataFrame{sid, merged})
+  │    → 写所有 worker credFD pipe
+  └ 4. 204
+```
+
+**credFD 帧格式**：
+
+```
+[4B LE uint32 length][JSON UserDataFrame]
+
+type UserDataFrame struct {
+    SID     string          `json:"sid"`
+    Payload json.RawMessage `json:"payload,omitempty"` // nil/absent = 删除
+}
+// 快照结束哨兵：SID="" Payload=nil
+```
+
+**JSON Merge Patch（RFC 7396）实现**：patch 或 base 任一非 object 时，patch 整体替换 base；否则以 base 为底，patch 的 key 覆盖，null value 删除对应 key，其余 key 保留。
+
+#### Worker 启动全量重放
+
+`runProxyWorkerProcess` 中（`proxy.go`）：
+
+```
+1. createCredPipe() → (readFD, writeFD)
+2. cmd.ExtraFiles += os.NewFile(readFD, "proxy-cred")
+3. cmd.Start()                      ← fork worker（已有逻辑）
+4. store.mu.RLock()
+5.   for sid, payload := range store.snapshot() {
+         writeFrame(writeFD, UserDataFrame{sid, payload})
+     }
+6.   writeFrame(writeFD, UserDataFrame{})  ← sentinel（SID=""）
+7. store.mu.RUnlock()
+8. credBC.Register(writeFD)         ← 注册增量更新
+9. go monitorWorker(cmd)            ← 已有逻辑
+```
+
+步骤 4-7 持 RLock，保证快照与增量注册之间无帧丢失（RLock 期间 Broadcast 排队等待释放）。
+
+Worker 端 credFD reader goroutine：
+
+```go
+func (v *WorkerView) RunCredReader(fd int) {
+    f := os.NewFile(uintptr(fd), "proxy-cred")
+    defer f.Close()
+    for {
+        frame, err := readUserDataFrame(f)
+        if err != nil { return }
+        v.credMu.Lock()
+        switch {
+        case frame.SID == "":         v.credReady = true          // sentinel
+        case frame.Payload == nil:    delete(v.credStore, frame.SID)
+        default:                      v.credStore[frame.SID] = frame.Payload
+        }
+        v.credMu.Unlock()
+    }
+}
+```
+
+#### MMDS 读侧扩展
+
+`mmds.Source` 新增 `UserData(sid string) (json.RawMessage, bool)`；`WorkerView` 实现该方法，在 `credReady=true` 后读 credStore。
+
+`Server.Handler()` 新增端点：
+
+```go
+mux.HandleFunc("GET /latest/user-data", s.getUserData)
+// verifyToken(X-metadata-token) → sid → src.UserData(sid) → 200 JSON
+// token 无效 → 401；无 user-data → 404
+```
+
+#### 关键时序
+
+**PUT / PATCH 写流**：
+
+```
+业务系统          proxy master AdminServer        worker × K
+    │                     │                           │
+    │ PUT {sid}/user-data │                           │
+    ├────────────────────►│ store.put(sid, body)      │
+    │                     │ credBC.Broadcast ─────────►│ credStore[sid] = body
+    │◄── 204 ─────────────┤                           │
+    │ PATCH {sid}/user-data                           │
+    ├────────────────────►│ jsonMergePatch → merged   │
+    │                     │ credBC.Broadcast ─────────►│ credStore[sid] = merged
+    │◄── 204 ─────────────┤                           │
+```
+
+**Worker 崩溃重启**：
+
+```
+proxy master                        new worker
+    │ createCredPipe()                   │
+    │ cmd.Start() ──────────────────────►│ fork
+    │ store.RLock()                      │
+    │── frame(sid-1, payload) ──────────►│ credStore[sid-1] = ...
+    │── frame(sid-2, payload) ──────────►│ credStore[sid-2] = ...
+    │── sentinel("", nil) ──────────────►│ credReady = true
+    │ credBC.Register()                  │ 开始服务 GET /latest/user-data
+    │ store.RUnlock()                    │
+```
+
+**Guest 读流**：
+
+```
+guest 进程               proxy worker MMDS server
+    │ PUT /latest/api/token   │  （现有流程）
+    ├────────────────────────►│ ByFloatingIP → sid → HMAC token
+    │◄── token ───────────────┤
+    │ GET /latest/user-data   │
+    │ X-metadata-token: <tok> │
+    ├────────────────────────►│ verifyToken → sid
+    │                         │ WorkerView.UserData(sid)
+    │◄── 200 + JSON ──────────┤ ← credStore[sid]（credReady 后可用）
+```
+
+#### 可靠性与安全边界
+
+| 场景 | 影响 |
+|------|------|
+| conductor 重启 | ✅ 无影响，user-data 在 master 内存与 conductor 无关 |
+| worker 单独崩溃 | ✅ master fork 后立即重放全量快照，新 worker credReady 后无缝服务 |
+| proxy master 崩溃 | ❌ user-data 永久丢失，调用方需在 proxy 重启后重新 PUT/PATCH |
+| sandbox 删除 | ⚠️ 需调用方额外调 `DELETE /sandboxes/{sid}/user-data`，否则 credStore 出现孤儿条目 |
+| 写入权威 | ⚠️ admin UDS 0600，节点上所有 root 进程均可写，绕过 conductor API key 访问控制 |
+| sandbox 间隔离 | ✅ MMDS session token 绑定 floatingIP → sid，sandbox 只能读自身 |
+
+**proxy master 崩溃恢复约定**：调用方应监听 admin UDS 可达事件（proxy master 就绪），在重启后批量重推所有 sandbox 的 user-data（调用方自行持久化，重推成本等同全量 PUT）。
+
+### 4.7.1 user-data 通用扩展设计（规划）
 
 #### 需求
 
-系统（conductor / 业务 API）在 sandbox 运行期间向其注入凭据（任意 JSON），sandbox 内的用户业务进程通过 MMDS 读取，无需修改 guest 镜像或经由 envd 中转。
+系统（conductor / 业务 API）在 sandbox 运行期间向其注入任意 JSON 数据（user-data），sandbox 内的用户业务进程通过 MMDS 读取，无需修改 guest 镜像或经由 envd 中转。user-data 内容对平台透明，典型用途包括：凭据注入、运行时配置、特性开关、实例级环境变量等。
 
 #### 架构约束
 
@@ -1216,11 +1422,12 @@ envd（guest 内）                         proxy MMDS server
 
 ```
 [业务系统 / conductor]
-      │  PUT /sandbox/{sid}/user-data  (HTTP，admin UDS，root ns)
+      │  PUT   /sandbox/{sid}/user-data  (全量替换，HTTP，admin UDS，root ns)
+      │  PATCH /sandbox/{sid}/user-data  (部分合并，HTTP，admin UDS，root ns)
       ▼
 [proxy master]
-  credStore: sync.Map[sid → json.RawMessage]
-      │  credFD pipe（每 worker 一条，[4B len][json(CredentialEntry)] 帧）
+  credStore: sync.Map[sid → json.RawMessage]   ← 始终存储已 merge 后的最终值
+      │  credFD pipe（每 worker 一条，[4B len][json(UserDataEntry)] 帧）
       │  新 worker 启动时需全量重放当前 credStore
       ▼
 [proxy worker]
@@ -1231,7 +1438,7 @@ envd（guest 内）                         proxy MMDS server
 [guest 业务进程]
 ```
 
-proxy master 新增一个 `AdminListen`（UDS，root ns，`0600` 权限），接受凭据写入请求。master 更新本地 credStore，通过 per-worker credFD pipe 推送 `CredentialEntry{sid, payload}` 帧给所有 worker，worker 维护各自的本地 credStore。
+proxy master 新增一个 `AdminListen`（UDS，root ns，`0600` 权限），接受 user-data 写入请求。master 更新本地 credStore（PATCH 时在 master 侧执行 JSON merge 后再存储合并结果），通过 per-worker credFD pipe 推送 `UserDataEntry{sid, payload}` 帧给所有 worker，worker 维护各自的本地 credStore。下游分发始终携带合并后的完整 payload，不传播 PATCH 操作本身。
 
 **优点**：不需要修改 routesync 协议；conductor 无需感知凭据概念；延迟低，一次 UDS 调用即可。
 
@@ -1241,14 +1448,17 @@ proxy master 新增一个 `AdminListen`（UDS，root ns，`0600` 权限），接
 
 **缺点（安全）**：admin UDS 绕过了 conductor 作为写入权威的现有链路（conductor → routesync → master），任何宿主机上的 root 进程均可直接向任意 sandbox 注入凭据，不经过 conductor 的访问控制。
 
-##### 方案 B：通过 routesync 下发（TypeCredential）
+##### 方案 B：通过 routesync 下发（TypeUserData）
 
 ```
-[conductor]
-      │  routesync 流：TypeCredential 帧（h2c stream，与 Upsert/Delete 同路）
+[conductor REST API]
+      │  PUT   /sandboxes/{sid}/user-data  (全量替换)
+      │  PATCH /sandboxes/{sid}/user-data  (部分合并，conductor 侧 merge 后持久化)
+      │  → 写 SQLite sandbox_user_data 表（始终存最终合并值）
+      │  → routesync 流：TypeUserData 帧（h2c stream，与 Upsert/Delete 同路）
       ▼
 [proxy master subscriber]
-  MasterView.ApplyCredential()
+  MasterView.ApplyUserData()
   credStore + credBC（CredBroadcaster）
       │  credFD pipe → workers（含新 worker 启动时全量重放）
       ▼
@@ -1260,15 +1470,16 @@ proxy master 新增一个 `AdminListen`（UDS，root ns，`0600` 权限），接
 新增 routesync 消息类型：
 
 ```go
-const TypeCredential = "credential"
+const TypeUserData = "user_data"
 
-type CredentialEntry struct {
+type UserDataEntry struct {
     SandboxID string          `json:"sid"`
     Payload   json.RawMessage `json:"payload,omitempty"` // nil = 清除
+    Rev       int64           `json:"rev"`               // 写入时间戳，供日志排序
 }
 ```
 
-conductor 持久化凭据（DB），proxy master 重连时 conductor 重推所有 TypeCredential 帧，与路由重放对称。
+conductor 在接收 PUT/PATCH 请求时，**在 DB 层完成 merge**（PATCH = 读当前值 → RFC 7396 JSON Merge Patch → 写回），再将**合并后的完整值**作为 TypeUserData 帧分发，proxy master 和 worker 只需处理"设置完整值"或"清除"两种操作，无需感知 PATCH 语义。重连时 conductor 重推所有 TypeUserData 帧，与路由重放对称。
 
 **优点**：master 崩溃后凭据随 routesync 重连自动恢复，与路由恢复行为完全对称，不破坏现有可靠性边界；写入权威保持在 conductor，不扩展安全面。
 
@@ -1292,18 +1503,45 @@ conductor 持久化凭据（DB），proxy master 重连时 conductor 重推所�
 
 | 维度 | 方案 A（admin 端点） | 方案 B（routesync） |
 |------|---------------------|---------------------|
-| 改动范围 | proxy master + worker + mmds | routesync proto + conductor + master + worker + mmds |
-| conductor 重启 | 凭据不受影响（master 内存存活） | 凭据随路由自动重放恢复 |
-| master 崩溃恢复 | **凭据永久丢失，需外部重推** | 自动恢复（需 conductor 持久化） |
+| 改动范围 | proxy master + worker + mmds | routesync proto + conductor DB + master + worker + mmds |
+| 控制面 API | PUT + PATCH 打到 proxy master admin UDS | PUT + PATCH 打到 conductor REST，conductor merge 后下发 |
+| conductor 重启 | user-data 不受影响（master 内存存活） | user-data 随路由自动重放恢复 |
+| master 崩溃恢复 | **user-data 永久丢失，需外部重推** | 自动恢复（需 conductor 持久化） |
 | worker 崩溃恢复 | 需 master 重放全量（两方案同） | 同左 |
 | 写入权威 | 绕过 conductor，root 进程可直接写 | 保持 conductor 权威链 |
-| 适用场景 | 凭据生命周期与 proxy 进程解耦可接受 | 要求与路由同等可靠性保证 |
+| PATCH merge 位置 | proxy master 侧 merge | conductor 侧 merge（持久化前完成） |
+| 适用场景 | user-data 生命周期与 proxy 进程解耦可接受 | 要求与路由同等可靠性保证 |
 
-**选择依据**：若业务系统能在 proxy 重启事件后主动重推凭据（有健壮的 proxy 重启通知和重推机制），方案 A 实现最简；若要求凭据恢复与路由恢复同等透明、不引入外部重推依赖，选方案 B，但需同步在 conductor 侧增加凭据持久化。
+**选择依据**：若业务系统能在 proxy 重启事件后主动重推 user-data（有健壮的重启通知和重推机制），方案 A 实现最简，且 merge 逻辑就近在 master 侧完成；若要求 user-data 恢复与路由恢复同等透明、不引入外部重推依赖，选方案 B，但需同步在 conductor 侧增加 user-data 持久化（SQLite `sandbox_user_data` 表）。
 
-#### MMDS 端点扩展（两方案共用）
+#### 控制面写 API 设计（参考 Firecracker MMDS 语义）
 
-无论哪种写入路径，读侧设计相同：
+Firecracker MMDS 原生提供三个管理接口：`PUT /mmds`（全量替换）、`PATCH /mmds`（部分合并）、`GET /mmds`（读取）。infra 仓库中 `fc.apiClient.setMmds()` 使用 `PUT /mmds` 在 cold boot 和 resume 时全量写入 `{instanceID, envID, address, accessTokenHash}`，PATCH 接口存在于生成的客户端但当前无调用方。
+
+kuasar-sandbox 不使用 Firecracker，但沿用相同的 PUT/PATCH 语义作为控制面 API 约定，定义如下：
+
+| 方法 | 路径 | 语义 | 参考 |
+|------|------|------|------|
+| `PUT` | `/sandboxes/{id}/user-data` | **全量替换**：body 直接覆盖现有 user-data | 等同 FC `PUT /mmds` |
+| `PATCH` | `/sandboxes/{id}/user-data` | **部分合并**：按 RFC 7396 JSON Merge Patch 递归合并，patch 中的 key 覆盖现有值，null value 删除对应 key，未提及的 key 保留 | 等同 FC `PATCH /mmds` |
+| `DELETE` | `/sandboxes/{id}/user-data` | **清除**：删除全部 user-data | — |
+
+两个 HTTP 动词的响应：成功返回 `204 No Content`，body 无效（非 JSON）或超过 64 KB 返回 `400 Bad Request`。
+
+**PATCH JSON Merge 示例**
+
+```
+初始值:    {"db_host": "10.0.0.1", "db_pass": "secret", "region": "cn-bj"}
+PATCH body: {"db_pass": "new_secret", "region": null, "timeout": 30}
+合并后:    {"db_host": "10.0.0.1", "db_pass": "new_secret", "timeout": 30}
+           （region 因 null 被删除，db_host 未提及保留，timeout 为新增）
+```
+
+**merge 在 conductor 侧执行**：无论 PUT 还是 PATCH，conductor 在写 DB 前完成合并，向下游（routesync TypeUserData / credFD pipe）分发的**始终是合并后的完整 JSON payload**。proxy master、worker 不感知 PUT/PATCH 区别，只处理"设置完整值"和"清除"两种语义，降低分布式状态同步复杂度。
+
+#### MMDS 端点扩展（两方案共用，读侧）
+
+无论哪种写入路径，guest 读侧设计相同：
 
 **mmds.Source 接口新增方法**
 
@@ -1328,12 +1566,13 @@ guest 业务进程                           proxy MMDS server
      ├───────────────────────────────────►│
      │                                    │  verifyToken → sid
      │                                    │  WorkerView.UserData(sid)
-     │◄─── {credentials JSON} ────────────┤
+     │◄─── {user-data JSON} ──────────────┤
 ```
 
-- 未设置凭据时返回 404。
-- token 验证失败（过期、伪造）返回 401。
-- 凭据内容对 MMDS server 透明（raw JSON）。
+- 未设置 user-data 时返回 404。
+- token 验证失败（伪造、过期）返回 401。
+- payload 内容对 MMDS server 完全透明（raw JSON 原样返回）。
+- guest **只能读**，不提供写端点，写入权威始终在 host 控制面。
 
 #### 可靠性与安全边界分析
 
@@ -1345,6 +1584,52 @@ guest 业务进程                           proxy MMDS server
 | 写入权威 | ⚠️ 绕过 conductor，root 进程可直接注入 | ✅ conductor 权威链完整保留 |
 | 读侧隔离 | ✅ HMAC token 绑定 floatingIP → sid | ✅ 同左 |
 | sandbox 间隔离 | ✅ token 与 sid 绑定，不同 sandbox 不通用 | ✅ 同左 |
+
+#### proxyshm 明文凭据安全风险
+
+无论采用哪种写入方案，`UserData` 凭据最终都需要在 proxy worker 内存中以明文可读形式存在（供 MMDS GET 时返回）。现有 proxyshm 已有相同问题，值得在此一并说明。
+
+**现有 proxyshm 中的明文敏感字段**
+
+`mmapRecord`（`orchestrator/internal/proxyshm/table.go`）中以下三个字段以明文存储在 mmap 文件中：
+
+| 字段 | 大小 | 内容 | 用途 |
+|------|------|------|------|
+| `AccessToken` | 256 B | 明文 envdAccessToken | 数据面 `X-Access-Token` 鉴权 |
+| `TrafficAccessToken` | 256 B | 明文 SDK 兼容 token | create 时返回给 SDK |
+| `MmdsSecret` | 128 B | hex 编码 HMAC-SHA256 key | MMDS session token 签名 |
+
+这些字段从 routesync `RouteEntry` JSON 直接写入 SHM，无任何加密或混淆。
+
+**现有保护措施**
+
+- 文件权限 `0600`：仅 master 进程属主（root）可读写，普通用户无法直接读取。
+- 路径位于 `/run/sandbox/`：`/run` 通常挂载为 tmpfs，正常路径下不落盘持久化。
+- master 退出时 `defer os.Remove(cfg.ShmPath)` 清理文件（正常退出路径有效）。
+- 传输侧走 UDS h2c，无网络暴露面。
+
+**主要风险面**
+
+1. **爆炸半径（最高优先级）**：proxyshm 是**单文件全量路由表**，存储节点上所有 sandbox 的凭据。一旦该文件被任何具有 root 权限的进程读取，整个节点所有 sandbox 的 AccessToken、MmdsSecret 同时泄露，不是单个 sandbox 的损失。
+
+2. **swap 换页**：若主机启用了 swap（含 zswap），内存压力下 page cache 中的 SHM 页可能被换出至磁盘或 zRAM，使敏感字段离开可控内存区域。现有代码未调用 `mlock()`。
+
+3. **core dump**：master 或 worker 崩溃时若产生 core dump，整个 mmap 区域内容会被写入 dump 文件。如果 dump 路径权限较宽或落入共享目录，完整路由表连同所有凭据将写入文件系统。
+
+4. **master 崩溃后文件残留**：`defer os.Remove()` 依赖 Go runtime 执行，SIGKILL 或 OOM 杀死 master 时 deferred 函数不执行，SHM 文件残留在文件系统，直至节点重启或下一次 `Create()` 覆盖。
+
+5. **`/proc/PID/mem` 侧信道**：持有 mmap 的进程的 `/proc/{pid}/mem` 允许具备 ptrace 权限的进程读取，威胁模型与 root 直接读文件相同，但提供了额外的内核级访问路径。
+
+**加固方向**
+
+| 措施 | 效果 | 实施成本 |
+|------|------|---------|
+| `memfd_create("proxyshm", MFD_CLOEXEC)` 替代普通文件 | 彻底去除文件系统可见性；worker 通过 ExtraFiles 继承 fd，无需路径 open；master 崩溃后匿名 fd 随进程消亡，不残留 | 中（需修改 Create/Open 接口，fd 传递已有机制可复用） |
+| `unix.Mlock(data)` 锁定 mmap 页 | 防止 SHM 页被 swap 换出到磁盘 | 低（一行调用，需 `CAP_IPC_LOCK`，root 进程默认具备） |
+| `prctl(PR_SET_DUMPABLE, 0)` | 禁止 master/worker 产生 core dump，防止凭据落盘 | 低（一行调用，代价是崩溃调试困难，建议仅生产环境开启） |
+| 凭据分区 SHM | 每个 worker 只 mmap 自己服务的 sandbox 子集（按 sandboxID hash 分区），单 worker 被攻陷后爆炸半径缩小 | 高（需重构 SHM 布局和 worker 路由分配逻辑） |
+
+**近期建议**：优先落地 `memfd_create`（去掉文件系统可见性，收益最大且不破坏现有接口）和 `mlock`（防 swap，代码量极小）。`prctl` 在部署中酌情开启。凭据分区为长期方向，当前设计阶段可不纳入。
 
 ### 4.8 API 设计
 
