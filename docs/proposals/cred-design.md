@@ -1,6 +1,6 @@
 # proxy 应用凭证管理 — 设计方案
 
-**状态**：草稿 · **版本**：v0.6 · **数据库**：SQLite (modernc.org/sqlite) · **涉及组件**：conductor · proxy · nacre-agent
+**状态**：草稿 · **版本**：v0.7 · **数据库**：SQLite (modernc.org/sqlite) · **涉及组件**：conductor · proxy · nacre-agent
 
 ---
 
@@ -21,6 +21,7 @@
 13. [安全设计](#13-安全设计)
 14. [错误处理](#14-错误处理)
 15. [实现路径](#15-实现路径)
+16. [备选方案：MMDS 动态转发至凭证生成组件](#16-备选方案mmds-动态转发至凭证生成组件)
 
 ---
 
@@ -732,3 +733,173 @@ proxy 重连过程中，credshm 已有旧条目（上次 Bookmark 留下的值�
 | | proxy master 初始化时创建 credshm 文件，并传入 `MasterView` | `cmd/node-ctl/proxy.go` | 必须 |
 | **P1 测试** | credshm 并发 fuzz；routesync CredPut/Bookmark 集成测试；MMDS handler 单测；store PutCredentials 幂等单测 | `*_test.go` | 推荐 |
 | **P2 加固** | 过期条目后台清理 goroutine；credshm 容量监控指标 | `credshm/cred.go` | 可选 |
+
+---
+
+## 16 备选方案：MMDS 动态转发至凭证生成组件
+
+本方案是第 10 节静态 credshm 投递的替代路径，适用于**短生命周期凭证**（数据库临时令牌、STS AssumeRole、Vault dynamic secrets 等）。两种方案可在同一 sandbox 内并存，MMDS 响应合并返回。
+
+### 16.1 核心思路
+
+主方案是**推模型**：nacre-agent 先推凭证到 conductor，再同步到 credshm，app 从本地 credshm 读。
+
+本方案是**拉模型**：app 向 MMDS 请求凭证时，MMDS worker 将请求实时转发至外部凭证生成组件，后者按需生成并返回，MMDS 可选短 TTL 缓存。凭证不经过 conductor DB、routesync、credshm 任何中间层，生命周期由凭证生成组件自主控制。
+
+```
+sandbox app (VM)
+    │  GET /latest/meta-data/credentials
+    │  X-metadata-token: <session-token>
+    ▼
+MMDS (proxy worker)
+    │  1. verifyToken → sandbox_id
+    │  2. 查 proxyshm：该 sandbox 是否配置了 cred_provider_url？
+    │     ├── 是 → 转发请求（见 16.3）
+    │     └── 否 → 从 credshm 读静态凭证
+    ▼
+凭证生成组件（外部，可以是 Vault / AWS STS / 自研 cred-service）
+    │  按需生成短期凭证，返回 [{key, value, version, expires_at}]
+    ▼
+MMDS → 合并静态 + 动态条目 → 200 JSON 响应
+```
+
+### 16.2 配置模型
+
+凭证生成组件的端点在沙箱启动时通过 LaunchSpec 写入，经 routesync 同步到 proxyshm：
+
+```go
+// types/types.go（扩展）
+type CredProviderConfig struct {
+    // 凭证生成组件的 HTTP 端点，空字符串表示不启用转发
+    URL string `json:"url"`
+    // MMDS 调用时携带的额外 Header（如 Authorization: Bearer <service-token>）
+    Headers map[string]string `json:"headers,omitempty"`
+    // 单次请求超时（ms），0 = 使用默认值 500ms
+    TimeoutMs int `json:"timeout_ms,omitempty"`
+    // 本地缓存 TTL（秒），0 = 不缓存（每次 app 请求都转发）
+    CacheTTLSec int `json:"cache_ttl_sec,omitempty"`
+}
+```
+
+该配置随 sandbox 路由通过 `TypeRouteUpsert` 下发到 proxy，写入 proxyshm route 记录的预留字段（或独立 credshm 配置区域）。凭证生成组件本身不经过 conductor DB——conductor 只存储静态凭证，动态端点配置跟路由一起传。
+
+### 16.3 转发协议
+
+MMDS worker 向凭证生成组件发起 HTTP POST，携带 sandbox 上下文：
+
+```
+POST <cred_provider_url>
+Content-Type: application/json
+Authorization: Bearer <service-token>        ← 来自 CredProviderConfig.Headers
+X-Sandbox-ID: <sandbox_id>                  ← 凭证生成组件据此识别租户
+X-Sandbox-Assertion: <hmac-sha256-hex>       ← 防伪造（见 16.4）
+
+{}   ← 请求体暂为空；生成组件通过 Header 获取所需上下文
+```
+
+响应格式与静态凭证端点完全一致：
+
+```json
+[
+  {"key": "db/primary", "value": "postgres://token:...", "version": 1700000000000, "expires_at": 1700003600},
+  {"key": "aws/session", "value": "{\"AccessKeyId\":\"ASIA...\",\"SecretAccessKey\":\"...\"}", "version": 1700000000000, "expires_at": 1700001800}
+]
+```
+
+### 16.4 请求断言：防止 sandbox 越权
+
+凭证生成组件需验证请求确实来自该 sandbox 的 MMDS，而非被伪造。MMDS worker 对每次转发请求计算断言：
+
+```go
+// mmds/mmds.go
+func (s *Server) credProviderAssertion(sid string) string {
+    // mmdsSecret 与 session token 签名同源，仅 proxy 持有
+    secret, _ := s.src.MmdsSecret(sid)
+    mac := hmac.New(sha256.New, secret)
+    mac.Write([]byte(sid))
+    mac.Write([]byte(strconv.FormatInt(time.Now().Unix()/30, 10))) // 30s 窗口
+    return hex.EncodeToString(mac.Sum(nil))
+}
+```
+
+凭证生成组件用同一 `MmdsSecret`（共享密钥，在沙箱启动时分配）验证断言，拒绝窗口外或 MAC 不匹配的请求。这与 MMDS session token 签名逻辑同构，无需引入新的密钥材料。
+
+### 16.5 缓存策略
+
+短生命周期凭证（如 15 分钟）若每次 app 请求都转发，会在高并发场景下给凭证生成组件带来大量压力。MMDS worker 本地维护一个轻量 per-sandbox 缓存：
+
+```go
+// mmds/cred_cache.go
+type credCache struct {
+    mu      sync.Mutex
+    entries map[string]*credCacheEntry // key = sandbox_id
+}
+
+type credCacheEntry struct {
+    entries   []CredEntry
+    expiresAt time.Time // = 获取时间 + min(CacheTTLSec, 最早 expires_at - 60s)
+}
+```
+
+缓存 TTL 取 `CredProviderConfig.CacheTTLSec` 与`（最早 expires_at - 当前时间 - 60s 余量）`的较小值，确保缓存内容在实际过期前 60 秒主动失效，app 在下次轮询时能拿到新值。
+
+沙箱删除时联动清理缓存条目（`ApplyDelete` 钩子）。
+
+### 16.6 MMDS 端点合并响应
+
+两种来源的凭证在同一 GET /credentials 响应中合并，app 无感知：
+
+```go
+// mmds/mmds.go — listCreds handler（扩展）
+func (s *Server) listCreds(w http.ResponseWriter, r *http.Request) {
+    sid := s.verifyToken(r)
+
+    // 静态凭证：来自 credshm
+    static := s.src.ListCredentials(sid)
+
+    // 动态凭证：转发至凭证生成组件（有配置时）
+    var dynamic []CredEntry
+    if cfg, ok := s.src.CredProviderConfig(sid); ok && cfg.URL != "" {
+        dynamic, _ = s.forwardCredRequest(r.Context(), sid, cfg)
+        // 转发失败时降级为空切片，静态凭证仍可正常返回
+    }
+
+    // 合并：动态优先（同 key 时动态覆盖静态）
+    merged := mergeCredEntries(static, dynamic)
+    json.NewEncoder(w).Encode(merged)
+}
+```
+
+**合并规则**：同 `key` 时动态凭证（更新鲜）覆盖静态凭证；不同 `key` 时追加。
+
+### 16.7 转发失败降级
+
+凭证生成组件不可用时，MMDS 不应阻塞 app 的正常运行。降级策略：
+
+| 场景 | 行为 |
+|------|------|
+| 转发超时（> TimeoutMs）| 返回上次缓存值（如有）；缓存已过期则返回空动态集合，静态凭证仍可用 |
+| HTTP 5xx | 同上 |
+| HTTP 4xx（配置错误）| 记录 warn 日志；返回空动态集合；不影响静态凭证 |
+| 网络不可达 | 同超时处理 |
+
+app 侧建议：在凭证 `expires_at` 前 60 秒主动轮询，而非等到 401 后重试，配合 MMDS 缓存 TTL 可保证续期不间断。
+
+### 16.8 与主方案对比
+
+| 维度 | 主方案（credshm 推模型）| 本备选方案（MMDS 转发拉模型）|
+|------|----------------------|--------------------------|
+| 适用凭证类型 | 长期凭证（API Key、DB 密码）| 短期/动态凭证（STS token、DB 临时密码、Vault lease）|
+| 凭证存储 | conductor DB + credshm（双副本）| 不落盘，仅在 MMDS 本地缓存（可选）|
+| 生命周期控制 | nacre-agent 显式推送更新 | 凭证生成组件自主控制（TTL、轮换策略）|
+| MMDS 响应延迟 | μs 级（credshm 内存读）| ms 级（网络转发，受缓存命中率影响）|
+| 凭证生成组件依赖 | 无（conductor 离线时仍可服务）| 在线依赖（降级时返回缓存或空集）|
+| conductor DB 写入 | 每次 PUT 写 DB | 仅端点 URL 配置随路由传输，无额外 DB 写入 |
+| 审计能力 | 写入时（conductor 记录）| 每次访问（凭证生成组件可逐次记录）|
+| 实现复杂度 | 较高（DB、routesync、credshm 全链路）| 较低（仅 MMDS 层新增转发逻辑 + 缓存）|
+
+### 16.9 适用场景建议
+
+- **选主方案**：凭证由平台侧（nacre-agent）统一管理，生命周期较长（小时~天），对投递延迟敏感，需要 proxy 重启后无损恢复。
+- **选本方案**：凭证由应用自有 IAM 体系生成（Vault、AWS STS、Kubernetes OIDC），生命周期短（分钟~小时），需要逐次访问审计，或者凭证生成逻辑与 conductor 完全解耦。
+- **混合使用**：平台配置的静态凭证走主方案，应用层短期令牌走本方案，二者在 MMDS 响应中对 app 透明合并。
