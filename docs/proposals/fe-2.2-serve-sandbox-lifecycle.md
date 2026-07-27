@@ -1416,25 +1416,81 @@ sequenceDiagram
 |------|------|------|
 | `result` | string | `toTemplate=true` 时为新 templateID（`<profile>-snp-<64hex>`）；否则为 base64 迁移令牌（见下） |
 
-**迁移令牌格式**（`toTemplate=false`）：`result = base64(json(SandboxToken))`，解码后 JSON 字段如下：
+**迁移令牌格式**（`toTemplate=false`）：`result = base64(json(SandboxToken))`，解码后 JSON 字段如下（`SandboxToken` struct，`internal/orch/migrate.go`）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `v` | int | 令牌版本，当前为 `1` |
-| `id` | string | 源沙箱 ID |
-| `template_id` | string | 模板 ID |
-| `snapshot_ref` | string | 远端快照引用，格式 `manifest://<64hex>` |
+| `template_id` | string | 源沙箱的模板 ID |
+| `snapshot_ref` | string | 远端快照引用，格式 `manifest://<64hex>`（导出时若源快照是 local，先 promote 为 remote） |
 | `profile` | string | 沙箱 profile（`e2b` / `bare`） |
-| `env` | object | 沙箱环境变量（可选） |
-| `metadata` | object | 业务元数据（可选） |
-| `deadline_unix` | int64 | 原 TTL deadline（Unix 秒，0 表示无限制，可选） |
-| `created_unix` | int64 | 原创建时间（Unix 秒，可选） |
-| `envd_access_token` | string | 数据面 envd 令牌（可选） |
-| `traffic_access_token` | string | 数据面流量令牌（可选） |
-| `mk_fingerprint` | string | `hex(SHA256(manifest_key)[:6])`，目标节点用于校验 API key 归属，**不含真实 key** |
-| `runtime_digest` | string | guest runtime erofs 的 SHA256；目标节点版本不匹配时拒绝导入 |
+| `env` | object | 沙箱环境变量；为空时省略（`omitempty`） |
+| `metadata` | object | 沙箱 metadata（业务 KV + `kuasar-sandbox.*` 命名空间原始 JSON 字符串，见 §4.10.4）；为空时省略 |
+| `deadline_unix` | int64 | 原 TTL deadline（Unix 秒）；为 `0` 时省略 |
+| `mk_fingerprint` | string | `hex(SHA256(manifest_key)[:12])`（12 字节截断，24 个 hex 字符），目标节点用于校验 API key 归属，**不含真实 key** |
+| `runtime_digest` | string | guest runtime erofs 的 SHA256（64 hex）；目标节点 runtime 不匹配时拒绝导入 |
+
+> token **不携带**源沙箱身份或数据面凭证——没有 `id`、`created_unix`、`envd_access_token`、`traffic_access_token` 字段：导入方总是分配全新 UUIDv7 并重新 mint 一对 envd/traffic 令牌（`internal/orch/migrate.go` `importSandboxWithKey`），`internal/orch/migrate_test.go` 专门断言了这几个字段不会出现在 token 里。
 
 > 导出失败（租户不匹配、沙箱未 paused 等）返回 400（附具体错误消息）或 404/403。
+
+**示例：导出（`toTemplate=false`，一次性迁移令牌）**
+
+导出前置条件是沙箱已 `paused`（见上方 pause 接口）：
+
+```
+POST /sandboxes/97994baa-8785-4151-a0b4-538baa678f80/export HTTP/1.1
+X-API-KEY: e2b_1a2b3c4d5e6f...
+Content-Type: application/json
+
+{"toTemplate": false, "keepSource": false}
+```
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "result": "eyJ2IjoxLCJ0ZW1wbGF0ZV9pZCI6ImUyYi1pbWctNjc2NTI4YmRiOGE0MmI5NGIzNWNkZDI5OTc3MWIxYWUyZDk1OTlkMTk3NjIwN2FjOGY0OGUyNDJhNWRhNjg2NiIsInNuYXBzaG90X3JlZiI6Im1hbmlmZXN0Oi8vMTljZWFkM2NiMmE4NWJlMTFlOThlNzc0MGI2ZjZlMzY1YzIzOWVhMjAzZmI2Yzc4NWVkZTdlNzAyZWQ3YTQzMCIsInByb2ZpbGUiOiJlMmIiLCJlbnYiOnsiVEFTS19JRCI6ImJhdGNoLTQyIn0sIm1ldGFkYXRhIjp7Im93bmVyIjoiYWxpY2UifSwiZGVhZGxpbmVfdW5peCI6MTc4NTIwMDMwMCwibWtfZmluZ2VycHJpbnQiOiJhZWFiNmJmNDI1ZGU4Mzc3NmI1NTIyZDUiLCJydW50aW1lX2RpZ2VzdCI6IjkzZjU5ODY1ODI4ZjQzMTc5MGMzMDE0NmViOTE2ZjllNmU1OWRhZDkxOWZlMmIwM2I1M2YzODA0Y2MwMjM2NDcifQ=="
+}
+```
+
+`keepSource=false`（默认关注点）：`ExportSandbox` 在 mint token 后立即 `st.Delete(sid)`，源节点该行随即消失——上面这次调用之后 `GET /sandboxes/97994baa-...` 会返回 404。`result` 解码（base64 → JSON）后即为：
+
+```json
+{
+  "v": 1,
+  "template_id": "e2b-img-676528bdb8a42b94b35cdd299771b1ae2d9599d1976207ac8f48e242a5da6866",
+  "snapshot_ref": "manifest://19cead3cb2a85be11e98e7740b6f6e365c239ea203fb6c785ede7e702ed7a430",
+  "profile": "e2b",
+  "env": {"TASK_ID": "batch-42"},
+  "metadata": {"owner": "alice"},
+  "deadline_unix": 1785200300,
+  "mk_fingerprint": "aeab6bf425de83776b5522d5",
+  "runtime_digest": "93f59865828f431790c30146eb916f9e6e59dad919fe2b03b53f3804cc023647"
+}
+```
+
+**示例：导出为模板（`toTemplate=true`）**
+
+```
+POST /sandboxes/97994baa-8785-4151-a0b4-538baa678f80/export HTTP/1.1
+X-API-KEY: e2b_1a2b3c4d5e6f...
+Content-Type: application/json
+
+{"toTemplate": true}
+```
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "result": "e2b-snp-19cead3cb2a85be11e98e7740b6f6e365c239ea203fb6c785ede7e702ed7a430"
+}
+```
+
+> `toTemplate=true` 直接拼装 `<profile>-snp-<快照 key>` 作为新 templateID 返回，不 mint token，也不删除源沙箱行（不受 `keepSource` 影响）；该快照 key 与上面迁移令牌里的 `snapshot_ref` 是同一份远端快照。
 
 ---
 
@@ -1450,9 +1506,49 @@ sequenceDiagram
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `sandboxID` | string | 导入后在本节点创建的 paused 沙箱 ID |
+| `sandboxID` | string | 导入后在本节点创建的 paused 沙箱 ID（全新 UUIDv7，与源沙箱 ID 无关） |
 
 > 导入失败（令牌无效、运行时版本不匹配、租户不符等）返回 400（附具体错误消息）。
+
+**示例：在目标节点导入**
+
+```
+POST /sandboxes/import HTTP/1.1
+X-API-KEY: e2b_1a2b3c4d5e6f...
+Content-Type: application/json
+
+{"token": "eyJ2IjoxLCJ0ZW1wbGF0ZV9pZCI6ImUyYi1pbWctNjc2NTI4YmRiOGE0MmI5NGIzNWNkZDI5OTc3MWIxYWUyZDk1OTlkMTk3NjIwN2FjOGY0OGUyNDJhNWRhNjg2NiIsInNuYXBzaG90X3JlZiI6Im1hbmlmZXN0Oi8vMTljZWFkM2NiMmE4NWJlMTFlOThlNzc0MGI2ZjZlMzY1YzIzOWVhMjAzZmI2Yzc4NWVkZTdlNzAyZWQ3YTQzMCIsInByb2ZpbGUiOiJlMmIiLCJlbnYiOnsiVEFTS19JRCI6ImJhdGNoLTQyIn0sIm1ldGFkYXRhIjp7Im93bmVyIjoiYWxpY2UifSwiZGVhZGxpbmVfdW5peCI6MTc4NTIwMDMwMCwibWtfZmluZ2VycHJpbnQiOiJhZWFiNmJmNDI1ZGU4Mzc3NmI1NTIyZDUiLCJydW50aW1lX2RpZ2VzdCI6IjkzZjU5ODY1ODI4ZjQzMTc5MGMzMDE0NmViOTE2ZjllNmU1OWRhZDkxOWZlMmIwM2I1M2YzODA0Y2MwMjM2NDcifQ=="}
+```
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "sandboxID": "3d1cbc22-af1e-46e1-a02f-1bba6c79e8c0"
+}
+```
+
+> 导入只插入一行 `state=paused` 的沙箱记录（`ManifestKey` 取目标节点解析出的 `mk`，`EnvdAccessToken`/`TrafficAccessToken` 全新 mint，`CreatedUnix` 为当前时间），**不会自动 resume**；需要再调用 `POST /sandboxes/3d1cbc22-.../connect` 或 `e2b sandbox resume 3d1cbc22-...` 触发真正的快照恢复（见 §4.4）。
+
+**示例：租户不匹配的导入失败**
+
+```
+POST /sandboxes/import HTTP/1.1
+X-API-KEY: e2b_wrong_tenant_key...
+Content-Type: application/json
+
+{"token": "eyJ2..."}
+```
+
+```
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{"error": "import-sandbox: token is for a different tenant"}
+```
+
+> 校验逻辑：`hex(Fingerprint(目标节点解析出的 manifest_key))` 与 token 里的 `mk_fingerprint` 逐字节比较（`internal/orch/migrate.go` `importSandboxWithKey`），不等则拒绝；`runtime_digest` 不匹配时返回类似 `"import-sandbox: runtime mismatch — this node's e2b runtime is <12hex>…, snapshot needs <12hex>…"`。
 
 ---
 
@@ -1718,6 +1814,163 @@ if mode == "log" → 放行 + 记 Warn 日志（token 不符但继续）
 > - `proxy_mode=external`：外部 proxy worker 缺少 manifest key，orchestrator 在 `routeEntry.MmdsSecret`（hex 编码）中携带预派生结果，proxy 的 `routetable.Table.MmdsSecret()` hex 解码后使用。
 > - **Session token 格式**：`"<sid>.<hex(HMAC-SHA256(MmdsSecret, sid))>"`，MMDS server 在 `PUT /latest/api/token` 时返回。
 > - **最终目的**：envd（FC 模式）用 session token 请求 `GET /`，MMDS server 验证后返回 `{accessTokenHash: hex(sha512(envdAccessToken))}`；envd 凭此 hash 在 guest 侧校验 SDK 传入的 `X-Access-Token`（defense-in-depth）。MMDS 禁用（envd 以 `-isnotfc` 启动）时整条路径不走。
+
+#### 4.10.4 bare profile 请求样例
+
+`bare` profile 用于不需要 envd 的场景（例如仅需 exec 能力的裸沙箱，或由 `X-Kuasar-Sandbox-Launch` 自带启动/插件进程的场景）。与 `e2b` profile 相比，控制面 API **路径和请求体格式完全一致**，差异体现在以下几点：
+
+| 差异点 | e2b profile | bare profile |
+|--------|-------------|---------------|
+| `templateID` 前缀 | `e2b-img-<64hex>` / `e2b-snp-<64hex>` | `bare-img-<64hex>` / `bare-snp-<64hex>` |
+| `envdVersion` | `"0.6.1"` | `"0.1.0"` |
+| `envdAccessToken` | 64-hex 令牌 | 空字符串 `""` |
+| `EnvdUDS` / `CiUDS`（内部字段，不出现在响应中）| 已设置 | 保持空（不启动 envd）|
+| create 编排步骤 | 含 `waitReady`（poll envd /health）+ `envdInit`（POST /init：下发 env vars + accessToken）| 跳过，`lc.Start` 成功后即视为就绪 |
+| `envVars` 请求字段 | 经 `envdInit`（POST /init）下发进 guest（§4.2 步骤 7.k）| **无效**：bare 无 envd，不执行 `envdInit`；guest 进程环境改用 `X-Kuasar-Sandbox-Launch.env` 指定 |
+| `X-Kuasar-Sandbox-Launch` 覆盖 | 拒绝（`launch override is not allowed for the e2b profile`，envd 独占 launch）| 允许：覆盖 guest 启动进程 exec/args/env/workdir/user/stop_signal，并可附加常驻 `plugin[]` 进程 |
+| 数据面访问令牌校验 | proxy 按 `enforce/log/off` 校验 `X-Access-Token` | `route.AccessToken == ""`，proxy 无论哪档均放行（见 §4.10.3「控制面 vs 数据面认证」）|
+
+**示例 1：创建 bare 沙箱（kind=img 冷启动，携带全量 `X-Kuasar-Sandbox-*` 命名空间）**
+
+```
+POST /sandboxes HTTP/1.1
+Host: node1.internal
+X-API-KEY: e2b_1a2b3c4d5e6f...
+X-Kuasar-Sandbox-Resource: {"capacity":{"cpu":2,"memory":"2GiB"},"allocatable":{"cpu":1.5,"memory":"1536MiB","deflate_on_oom":true}}
+X-Kuasar-Sandbox-Network: {"hostname":"sbx-42","dns":["10.0.0.2","8.8.8.8"],"inner_ip":"10.0.3.15/24","nexthop":"10.0.3.1","transit_gateway_ip":"10.0.0.1","transit_geneve_vni":100,"transit_mac":"02:00:00:00:00:2a"}
+X-Kuasar-Sandbox-Launch: {"exec":"/usr/bin/python3","args":["-m","http.server","8080"],"env":{"PYTHONUNBUFFERED":"1"},"workdir":"/app","restart":"always","user":"1000:1000","stop_signal":"SIGTERM","plugin":[{"exec":"/usr/local/bin/log-shipper","args":["--config","/etc/log-shipper.yaml"],"env":{"LOG_LEVEL":"info"},"workdir":"/","user":"0:0","restart":"always"}]}
+X-Kuasar-Sandbox-Init: [{"exec":"/bin/sh","args":["-c","mkdir -p /data/output"],"env":{"STAGE":"init"},"workdir":"/","user":"root","timeout":"10s"}]
+X-Kuasar-Sandbox-Mounts: [{"target":"/mnt/data","type":"disk","source":"data0"},{"target":"/tmp/scratch","type":"tmpfs","options":"size=512m"}]
+X-Kuasar-Sandbox-Files: [{"path":"/etc/motd","content":"hello from bare\n","mode":"0644","owner":"root:root","read_only":false}]
+X-Kuasar-Sandbox-Metadata: {"team":"data-eng","job_id":"batch-42"}
+Content-Type: application/json
+
+{
+  "templateID": "bare-img-ddb92966b1672dced372728c1f79cbdf3b95fc98d7203ecd9a0974cae2b63a7c",
+  "timeout": 300,
+  "metadata": {"owner": "alice"}
+}
+```
+
+> `envVars` 请求体字段依赖 envd 的 `/init` 调用下发（§4.2 步骤 7.k，仅 e2b profile 执行），bare 沙箱不应携带该字段；如需向 guest 注入环境变量，应通过 `X-Kuasar-Sandbox-Launch.env`（进程环境）或 `X-Kuasar-Sandbox-Init[].env`（一次性 init 命令环境）指定。
+
+```
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "sandboxID": "ebd60ec3-85ea-47c0-8ba9-19b01772fb2d",
+  "templateID": "bare-img-ddb92966b1672dced372728c1f79cbdf3b95fc98d7203ecd9a0974cae2b63a7c",
+  "clientID": "orchestrator",
+  "domain": "e2b.dev",
+  "envdVersion": "0.1.0",
+  "envdAccessToken": "",
+  "trafficAccessToken": "8f5f53f934fe38990ec9f2a69837440ac5ef5e1893e012a27b3ae71c7b40fa0b",
+  "alias": ""
+}
+```
+
+> 因无 envd，create 流程在 `lc.Start(runnerUnit(sid))` 成功后即视为就绪，不执行 §4.2 步骤 7.j（`waitReady`）/ 7.k（`envdInit`）。
+
+**示例 2：查询沙箱详情（`metadata` 字段全量样例）**
+
+```
+GET /sandboxes/ebd60ec3-85ea-47c0-8ba9-19b01772fb2d HTTP/1.1
+X-API-KEY: e2b_1a2b3c4d5e6f...
+```
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "sandboxID": "ebd60ec3-85ea-47c0-8ba9-19b01772fb2d",
+  "templateID": "bare-img-ddb92966b1672dced372728c1f79cbdf3b95fc98d7203ecd9a0974cae2b63a7c",
+  "clientID": "orchestrator",
+  "domain": "e2b.dev",
+  "envdVersion": "0.1.0",
+  "envdAccessToken": "",
+  "trafficAccessToken": "8f5f53f934fe38990ec9f2a69837440ac5ef5e1893e012a27b3ae71c7b40fa0b",
+  "alias": "",
+  "state": "running",
+  "startedAt": 1785200000,
+  "endAt": 1785200300,
+  "metadata": {
+    "owner": "alice",
+    "kuasar-sandbox.resource": "{\"capacity\":{\"cpu\":2,\"memory\":\"2GiB\"},\"allocatable\":{\"cpu\":1.5,\"memory\":\"1536MiB\",\"deflate_on_oom\":true}}",
+    "kuasar-sandbox.network": "{\"hostname\":\"sbx-42\",\"dns\":[\"10.0.0.2\",\"8.8.8.8\"],\"inner_ip\":\"10.0.3.15/24\",\"nexthop\":\"10.0.3.1\",\"transit_gateway_ip\":\"10.0.0.1\",\"transit_geneve_vni\":100,\"transit_mac\":\"02:00:00:00:00:2a\"}",
+    "kuasar-sandbox.launch": "{\"exec\":\"/usr/bin/python3\",\"args\":[\"-m\",\"http.server\",\"8080\"],\"env\":{\"PYTHONUNBUFFERED\":\"1\"},\"workdir\":\"/app\",\"restart\":\"always\",\"user\":\"1000:1000\",\"stop_signal\":\"SIGTERM\",\"plugin\":[{\"exec\":\"/usr/local/bin/log-shipper\",\"args\":[\"--config\",\"/etc/log-shipper.yaml\"],\"env\":{\"LOG_LEVEL\":\"info\"},\"workdir\":\"/\",\"user\":\"0:0\",\"restart\":\"always\"}]}",
+    "kuasar-sandbox.init": "[{\"exec\":\"/bin/sh\",\"args\":[\"-c\",\"mkdir -p /data/output\"],\"env\":{\"STAGE\":\"init\"},\"workdir\":\"/\",\"user\":\"root\",\"timeout\":\"10s\"}]",
+    "kuasar-sandbox.mounts": "[{\"target\":\"/mnt/data\",\"type\":\"disk\",\"source\":\"data0\"},{\"target\":\"/tmp/scratch\",\"type\":\"tmpfs\",\"options\":\"size=512m\"}]",
+    "kuasar-sandbox.files": "[{\"path\":\"/etc/motd\",\"content\":\"hello from bare\\n\",\"mode\":\"0644\",\"owner\":\"root:root\",\"read_only\":false}]",
+    "kuasar-sandbox.metadata": "{\"team\":\"data-eng\",\"job_id\":\"batch-42\"}"
+  }
+}
+```
+
+> `sb.Metadata` 底层类型为 `map[string]string`：请求体 `metadata`（业务 KV，如 `owner`）与各 `X-Kuasar-Sandbox-*` 请求头**原样**并入同一 map（键为 `kuasar-sandbox.<namespace>`，值为请求头的原始 JSON 文本，未做二次解析），因此响应 JSON 中每个命名空间的值都是被转义的 JSON 字符串，而非嵌套对象；未携带的命名空间不出现在响应中。
+
+**示例 3：在 bare 沙箱内 exec（不依赖 envd）**
+
+exec 走 WebSocket 控制面（`sandbox-ctl exec` → vsock → `sandbox-init`），与 profile 无关，bare 沙箱下调用方式和响应完全相同：
+
+```
+GET /sandboxes/ebd60ec3-85ea-47c0-8ba9-19b01772fb2d/exec HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Protocol: sandbox-exec.v1
+X-API-KEY: e2b_1a2b3c4d5e6f...
+
+101 Switching Protocols
+Sec-WebSocket-Protocol: sandbox-exec.v1
+
+client → channel-3: {"cmd":["python3","-c","print('hello from bare')"]}
+← channel-1: b"hello from bare\n"
+← channel-4: {"exit_code":0,"timed_out":false}
+```
+
+**示例 4：访问用户端口无需 `X-Access-Token`**
+
+```
+GET / HTTP/1.1
+Host: 8080-ebd60ec3-85ea-47c0-8ba9-19b01772fb2d.e2b.dev
+```
+
+> 因 `envdAccessToken` 为空，`routeEntry.AccessToken == ""`，proxy 的 `authorized` 判定在 `enforce`（默认）模式下同样直接放行（见 §4.10.3「控制面 vs 数据面认证」表），请求无需携带 `X-Access-Token` 头。
+
+**示例 5：pause / connect 响应同样保持空令牌**
+
+```
+POST /sandboxes/ebd60ec3-85ea-47c0-8ba9-19b01772fb2d/pause HTTP/1.1
+X-API-KEY: e2b_1a2b3c4d5e6f...
+
+204 No Content
+```
+
+```
+POST /sandboxes/ebd60ec3-85ea-47c0-8ba9-19b01772fb2d/connect HTTP/1.1
+X-API-KEY: e2b_1a2b3c4d5e6f...
+Content-Type: application/json
+
+{"timeout": 300}
+```
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "sandboxID": "ebd60ec3-85ea-47c0-8ba9-19b01772fb2d",
+  "templateID": "bare-snp-706e094bee15de87a66d1f97330602a20df7f2752e48f611f0b208f9fe9a0b8c",
+  "clientID": "orchestrator",
+  "domain": "e2b.dev",
+  "envdVersion": "0.1.0",
+  "envdAccessToken": "",
+  "trafficAccessToken": "8f5f53f934fe38990ec9f2a69837440ac5ef5e1893e012a27b3ae71c7b40fa0b",
+  "alias": ""
+}
+```
 
 ### 4.11 数据库设计
 
